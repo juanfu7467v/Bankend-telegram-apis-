@@ -4,6 +4,7 @@ import asyncio
 import threading
 import traceback
 import time
+import uuid
 import requests
 import json
 import base64
@@ -93,27 +94,12 @@ def record_bot_failure(bot_id: str):
 app = Flask(__name__)
 CORS(app)
 
-# --- Bucle Asíncrono para Telethon ---
-loop = asyncio.new_event_loop()
-threading.Thread(
-    target=lambda: (asyncio.set_event_loop(loop), loop.run_forever()), daemon=True
-).start()
-
-def run_coro(coro):
-    """Ejecuta una corrutina en el bucle principal y espera el resultado SÍNCRONAMENTE."""
-    # Asegúrate de que el cliente se haya inicializado con las credenciales correctas.
-    if API_ID == 0 or not API_HASH:
-         raise Exception("API_ID o API_HASH no configurados. Cliente Telethon no puede iniciar.")
-         
-    return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=SYNC_WAIT_TIMEOUT) 
-
 # --- Configuración del Cliente Telegram ---
-# Si API_ID o API_HASH son 0/vacío, el cliente fallará al iniciar, lo cual es manejado en run_coro.
-client = TelegramClient(session, API_ID, API_HASH, loop=loop)
+client = TelegramClient(session, API_ID, API_HASH)
 
 # Mensajes en memoria
 messages = deque(maxlen=2000)
-_messages_lock = threading.Lock()
+_messages_lock = asyncio.Lock()
 response_waiters = {} 
 pending_phone = {"phone": None, "sent_at": None}
 
@@ -236,7 +222,7 @@ async def _on_new_message(event):
 
         # 3. Intentar resolver la espera de la API
         resolved = False
-        with _messages_lock:
+        async with _messages_lock:
             keys_to_check = list(response_waiters.keys())
             for command_id in keys_to_check:
                 waiter_data = response_waiters.get(command_id)
@@ -260,16 +246,17 @@ async def _on_new_message(event):
                     is_immediate_error = "Por favor, usa el formato correcto" in msg_obj["message"] or msg_obj["fields"].get("not_found", False)
                     
                     if is_immediate_error:
-                        if waiter_data["timer"]:
-                             waiter_data["timer"].cancel()
-                        loop.call_soon_threadsafe(waiter_data["future"].set_result, msg_obj)
+                        if waiter_data.get("timer_task"):
+                             waiter_data["timer_task"].cancel()
+                        if not waiter_data["future"].done():
+                            waiter_data["future"].set_result(msg_obj)
                         response_waiters.pop(command_id, None)
                         resolved = True
                         break
 
         # 4. Agregar a la cola de historial si no se usó para una respuesta específica
         if not resolved:
-            with _messages_lock:
+            async with _messages_lock:
                 messages.appendleft(msg_obj)
 
     except Exception:
@@ -298,7 +285,7 @@ async def _call_api_command(command: str, timeout: int = TIMEOUT_TOTAL):
     if not await client.is_user_authorized():
         raise Exception("Cliente no autorizado. Por favor, inicie sesión.")
 
-    command_id = time.time()
+    command_id = str(uuid.uuid4())
     
     # Extraer DNI para hacer match con la respuesta
     # Nota: El regex revisa si hay 8 dígitos, asumiendo que es el DNI
@@ -318,7 +305,7 @@ async def _call_api_command(command: str, timeout: int = TIMEOUT_TOTAL):
                 final_error = {"status": "error", "message": f"Ambos bots están bloqueados. Último bot bloqueado: {current_bot_id}.", "bot_used": current_bot_id}
             continue
 
-        future = loop.create_future()
+        future = asyncio.get_event_loop().create_future()
         current_timeout = TIMEOUT_FAILOVER if attempt == 1 else max_timeout
         
         waiter_data = {
@@ -331,29 +318,28 @@ async def _call_api_command(command: str, timeout: int = TIMEOUT_TOTAL):
             "has_response": False 
         }
         
-        def _on_timeout(bot_id_on_timeout=current_bot_id, command_id_on_timeout=command_id):
+        async def _on_timeout_async(bot_id_on_timeout=current_bot_id, command_id_on_timeout=command_id):
             """Función de callback del timer para manejar el timeout de acumulación."""
-            with _messages_lock:
+            async with _messages_lock:
                 waiter_data = response_waiters.pop(command_id_on_timeout, None)
                 if waiter_data and not waiter_data["future"].done():
                     
                     if waiter_data["messages"]:
                         # Devolver mensajes acumulados si hay alguno (cumple acumulación)
                         print(f"✅ Timeout de {current_timeout}s alcanzado para acumulación en {bot_id_on_timeout}. Devolviendo {len(waiter_data['messages'])} mensaje(s).")
-                        loop.call_soon_threadsafe(
-                            waiter_data["future"].set_result, 
-                            waiter_data["messages"]
-                        )
+                        waiter_data["future"].set_result(waiter_data["messages"])
                     else:
                         # Si no hay respuesta, es un timeout (esto activa el failover si es el primer bot)
-                        loop.call_soon_threadsafe(
-                            waiter_data["future"].set_result, 
-                            {"status": "error_timeout", "message": f"Tiempo de espera de respuesta agotado ({current_timeout}s). No se recibió NINGÚN mensaje.", "bot": bot_id_on_timeout, "fail_recorded": False}
-                        )
+                        waiter_data["future"].set_result({"status": "error_timeout", "message": f"Tiempo de espera de respuesta agotado ({current_timeout}s). No se recibió NINGÚN mensaje.", "bot": bot_id_on_timeout, "fail_recorded": False})
 
-        waiter_data["timer"] = loop.call_later(current_timeout, _on_timeout)
+        # Programar el timeout usando asyncio.create_task para que sea asíncrono
+        async def _timer_task():
+            await asyncio.sleep(current_timeout)
+            await _on_timeout_async()
+        
+        waiter_data["timer_task"] = asyncio.create_task(_timer_task())
 
-        with _messages_lock:
+        async with _messages_lock:
             response_waiters[command_id] = waiter_data
 
         print(f"📡 Enviando comando (Intento {attempt}) a {current_bot_id} [Timeout: {current_timeout}s]: {command}")
@@ -463,11 +449,11 @@ async def _call_api_command(command: str, timeout: int = TIMEOUT_TOTAL):
             record_bot_failure(current_bot_id)
             final_error = {"status": "error", "message": error_msg, "bot_used": current_bot_id}
             
-            with _messages_lock:
+            async with _messages_lock:
                  if command_id in response_waiters:
                     waiter_data = response_waiters.pop(command_id, None)
-                    if waiter_data and waiter_data["timer"]:
-                        waiter_data["timer"].cancel()
+                    if waiter_data and waiter_data.get("timer_task"):
+                        waiter_data["timer_task"].cancel()
                         
             if attempt == 1:
                 continue
@@ -485,11 +471,11 @@ async def _call_api_command(command: str, timeout: int = TIMEOUT_TOTAL):
             else:
                  print(f"❌ Error de Timeout de Telethon en {current_bot_id}: {error_msg}.")
                  
-            with _messages_lock:
+            async with _messages_lock:
                  if command_id in response_waiters:
                     waiter_data = response_waiters.pop(command_id, None)
-                    if waiter_data and waiter_data["timer"]:
-                        waiter_data["timer"].cancel()
+                    if waiter_data and waiter_data.get("timer_task"):
+                        waiter_data["timer_task"].cancel()
 
             if attempt == 1:
                 continue
@@ -497,11 +483,10 @@ async def _call_api_command(command: str, timeout: int = TIMEOUT_TOTAL):
                 break
                 
         finally:
-            with _messages_lock:
-                if command_id in response_waiters:
-                    waiter_data = response_waiters.pop(command_id, None)
-                    if waiter_data and waiter_data["timer"]:
-                        waiter_data["timer"].cancel()
+            async with _messages_lock:
+                waiter_data = response_waiters.pop(command_id, None)
+                if waiter_data and waiter_data.get("timer_task"):
+                    waiter_data["timer_task"].cancel()
 
     if final_error:
         # Si ambos fallaron, eliminamos el 'bot_used' del error final antes de devolver
@@ -550,9 +535,11 @@ async def _ensure_connected():
             pass # No imprimir la traza completa cada 5 minutos
         await asyncio.sleep(300) # Revisa cada 5 minutos
 
-# Solo iniciar si las credenciales básicas están presentes
-if API_ID != 0 and API_HASH:
-    asyncio.run_coroutine_threadsafe(_ensure_connected(), loop)
+# Iniciar tareas de fondo al arrancar la app
+@app.before_first_request
+async def start_background_tasks():
+    if API_ID != 0 and API_HASH:
+        asyncio.create_task(_ensure_connected())
 
 # --- Rutas HTTP ---
 
@@ -564,23 +551,19 @@ def root():
     })
 
 @app.route("/status")
-def status():
+async def status():
     global SESSION_STRING # Asegurar que accedemos a la variable global
     
     # Intento de conexión ligera
     try:
-        run_coro(client.connect()) 
-    except FutureTimeoutError:
-         pass 
+        await client.connect() 
     except Exception:
          pass
 
     # Verificación de autorización
     is_auth = False
     try:
-        is_auth = run_coro(client.is_user_authorized())
-    except FutureTimeoutError:
-         is_auth = False
+        is_auth = await client.is_user_authorized()
     except Exception:
         is_auth = False
 
@@ -613,110 +596,87 @@ def status():
     })
 
 @app.route("/login")
-def login():
+async def login():
     phone = request.args.get("phone")
     if not phone: return jsonify({"error": "Falta parámetro phone"}), 400
 
-    async def _send_code():
-        if API_ID == 0 or not API_HASH:
-            raise Exception("API_ID o API_HASH no configurados. Cliente Telethon no puede iniciar.")
-            
-        await client.connect()
-        if await client.is_user_authorized(): return {"status": "already_authorized"}
-        try:
-            # Forcea la desconexión si está conectado con una sesión anterior inválida
-            await client.disconnect() 
-            await client.connect()
-            # Intenta enviar el código.
-            await client.send_code_request(phone)
-            pending_phone["phone"] = phone
-            pending_phone["sent_at"] = datetime.utcnow().isoformat()
-            return {"status": "code_sent", "phone": phone}
-        except errors.FloodWaitError as e: 
-            return {"status": "error", "error": f"Límite de intentos excedido. Intenta de nuevo en {e.seconds} segundos."}
-        except Exception as e: 
-            return {"status": "error", "error": str(e)}
-
+    if API_ID == 0 or not API_HASH:
+        return jsonify({"status": "error", "error": "API_ID o API_HASH no configurados."}), 500
+        
     try:
-        result = run_coro(_send_code())
-        return jsonify(result)
-    except FutureTimeoutError:
-        return jsonify({"status": "error", "error": f"Timeout en la conexión o proceso de login (espera max {SYNC_WAIT_TIMEOUT}s). Revise el estado de la conexión."}), 500
-    except Exception as e:
-        return jsonify({"status": "error", "error": f"Error interno en /login: {str(e)}"}), 500
+        await client.connect()
+        if await client.is_user_authorized(): return jsonify({"status": "already_authorized"})
+        
+        # Forcea la desconexión si está conectado con una sesión anterior inválida
+        await client.disconnect() 
+        await client.connect()
+        # Intenta enviar el código.
+        await client.send_code_request(phone)
+        pending_phone["phone"] = phone
+        pending_phone["sent_at"] = datetime.utcnow().isoformat()
+        return jsonify({"status": "code_sent", "phone": phone})
+    except errors.FloodWaitError as e: 
+        return jsonify({"status": "error", "error": f"Límite de intentos excedido. Intenta de nuevo en {e.seconds} segundos."})
+    except Exception as e: 
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 @app.route("/code")
-def code():
+async def code():
     global SESSION_STRING # Usamos la variable global
     code = request.args.get("code")
     if not code: return jsonify({"error": "Falta parámetro code"}), 400
     if not pending_phone["phone"]: return jsonify({"error": "No hay login pendiente"}), 400
 
     phone = pending_phone["phone"]
-    async def _sign_in():
-        if API_ID == 0 or not API_HASH:
-            raise Exception("API_ID o API_HASH no configurados. Cliente Telethon no puede iniciar.")
-            
-        try:
-            await client.connect() 
-            await client.sign_in(phone, code)
-            
-            # A partir de este punto, el cliente está autorizado y la sesión es válida.
-            pending_phone["phone"] = None
-            pending_phone["sent_at"] = None
-            
-            # **CLAVE: Guarda la nueva sesión generada e IMPRIME el String**
-            new_string = client.session.save()
-            SESSION_STRING = new_string # Actualiza la variable global en memoria
-            
-            print("=============================================================================================")
-            print("✅ AUTENTICACIÓN EXITOSA. COPIE ESTA SESIÓN y configúrela en la variable de entorno SESSION_STRING:")
-            print("=============================================================================================")
-            print(new_string)
-            print("=============================================================================================")
-            
-            return {"status": "authenticated", "session_string": new_string, "NOTE": "You must copy this session_string and set it as the SESSION_STRING environment variable for 24/7 persistence."}
-            
-        except errors.SessionPasswordNeededError: return {"status": "error", "error": "2FA requerido"}
-        except errors.PhoneCodeInvalidError: return {"status": "error", "error": "Código de verificación incorrecto."}
-        except errors.SessionPasswordNeededError: return {"status": "error", "error": "Contraseña de autenticación de dos pasos requerida. Usa /password."}
-        except Exception as e: return {"status": "error", "error": str(e)}
-
+    if API_ID == 0 or not API_HASH:
+        return jsonify({"status": "error", "error": "API_ID o API_HASH no configurados."}), 500
+        
     try:
-        result = run_coro(_sign_in())
-        return jsonify(result)
-    except FutureTimeoutError:
-        return jsonify({"status": "error", "error": f"Timeout en la conexión o proceso de código (espera max {SYNC_WAIT_TIMEOUT}s). Revise el estado de la conexión."}), 500
-    except Exception as e:
-        return jsonify({"status": "error", "error": f"Error interno en /code: {str(e)}"}), 500
+        await client.connect() 
+        await client.sign_in(phone, code)
+        
+        # A partir de este punto, el cliente está autorizado y la sesión es válida.
+        pending_phone["phone"] = None
+        pending_phone["sent_at"] = None
+        
+        # **CLAVE: Guarda la nueva sesión generada e IMPRIME el String**
+        new_string = client.session.save()
+        SESSION_STRING = new_string # Actualiza la variable global en memoria
+        
+        print("=============================================================================================")
+        print("✅ AUTENTICACIÓN EXITOSA. COPIE ESTA SESIÓN y configúrela en la variable de entorno SESSION_STRING:")
+        print("=============================================================================================")
+        print(new_string)
+        print("=============================================================================================")
+        
+        return jsonify({"status": "authenticated", "session_string": new_string, "NOTE": "You must copy this session_string and set it as the SESSION_STRING environment variable for 24/7 persistence."})
+        
+    except errors.SessionPasswordNeededError: return jsonify({"status": "error", "error": "2FA requerido"}), 401
+    except errors.PhoneCodeInvalidError: return jsonify({"status": "error", "error": "Código de verificación incorrecto."}), 401
+    except Exception as e: return jsonify({"status": "error", "error": str(e)}), 500
 
 @app.route("/send")
-def send_msg():
+async def send_msg():
     chat_id = request.args.get("chat_id")
     msg = request.args.get("msg")
     if not chat_id or not msg:
         return jsonify({"error": "Faltan parámetros"}), 400
 
-    async def _send(): 
+    try:
         await client.connect() 
         if not await client.is_user_authorized():
-            raise Exception("Cliente no autorizado. Inicie sesión.")
+            return jsonify({"status": "error", "error": "Cliente no autorizado. Inicie sesión."}), 401
             
         target = int(chat_id) if chat_id.isdigit() else chat_id
         entity = await client.get_entity(target)
         await client.send_message(entity, msg)
-        return {"status": "sent", "to": chat_id, "msg": msg}
-    try:
-        result = run_coro(_send())
-        return jsonify(result)
-    except FutureTimeoutError:
-         return jsonify({"status": "error", "error": f"Timeout al enviar mensaje (espera max {SYNC_WAIT_TIMEOUT}s). Revise el estado de la conexión."}), 500
+        return jsonify({"status": "sent", "to": chat_id, "msg": msg})
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500 
 
 @app.route("/get")
-def get_msgs():
-    with _messages_lock:
+async def get_msgs():
+    async with _messages_lock:
         data = list(messages)
         return jsonify({
             "message": "found data" if data else "no data",
@@ -797,7 +757,7 @@ def files(filename):
 @app.route("/exd", methods=["GET"])
 @app.route("/cor", methods=["GET"])
 @app.route("/dir", methods=["GET"]) # /dir tiene el mismo uso que /exd en tu descripción
-def api_dni_based_command():
+async def api_dni_based_command():
     command_name_path = request.path.lstrip('/') 
     command_name = "sun" if command_name_path in ["sunat", "sun"] else command_name_path
     
@@ -882,7 +842,7 @@ def api_dni_based_command():
     command = f"/{command_name} {param}".strip()
     
     try:
-        result = run_coro(_call_api_command(command, timeout=TIMEOUT_TOTAL)) 
+        result = await _call_api_command(command, timeout=TIMEOUT_TOTAL)
         
         if result.get("status", "").startswith("error"):
             # Lógica de códigos de estado HTTP mejorada
@@ -897,14 +857,11 @@ def api_dni_based_command():
             return jsonify(result), status_code
             
         return jsonify(result)
-    
-    except FutureTimeoutError:
-         return jsonify({"status": "error", "message": f"Error interno: Timeout síncrono excedido (max {SYNC_WAIT_TIMEOUT}s). La API de Telegram está saturada o no responde a tiempo para la espera síncrona."}), 504
     except Exception as e:
         return jsonify({"status": "error", "message": f"Error interno: {str(e)}"}), 500
 
 @app.route("/dni_nombres", methods=["GET"])
-def api_dni_nombres():
+async def api_dni_nombres():
     nombres = unquote(request.args.get("nombres", "")).strip()
     ape_paterno = unquote(request.args.get("apepaterno", "")).strip()
     ape_materno = unquote(request.args.get("apematerno", "")).strip()
@@ -919,7 +876,7 @@ def api_dni_nombres():
     command = f"/nm {formatted_nombres}|{formatted_apepaterno}|{formatted_apematerno}"
     
     try:
-        result = run_coro(_call_api_command(command, timeout=TIMEOUT_TOTAL))
+        result = await _call_api_command(command, timeout=TIMEOUT_TOTAL)
         if result.get("status", "").startswith("error"):
             status_code = 500
             if result.get("status") == "error_bot_format":
@@ -931,14 +888,11 @@ def api_dni_nombres():
             return jsonify(result), status_code
             
         return jsonify(result)
-        
-    except FutureTimeoutError:
-         return jsonify({"status": "error", "message": f"Error interno: Timeout síncrono excedido (max {SYNC_WAIT_TIMEOUT}s). La API de Telegram está saturada o no responde a tiempo para la espera síncrona."}), 504
     except Exception as e:
         return jsonify({"status": "error", "message": f"Error interno: {str(e)}"}), 500
 
 @app.route("/venezolanos_nombres", methods=["GET"])
-def api_venezolanos_nombres():
+async def api_venezolanos_nombres():
     query = unquote(request.args.get("query", "")).strip()
     
     if not query:
@@ -947,7 +901,7 @@ def api_venezolanos_nombres():
     command = f"/nmv {query}"
     
     try:
-        result = run_coro(_call_api_command(command, timeout=TIMEOUT_TOTAL))
+        result = await _call_api_command(command, timeout=TIMEOUT_TOTAL)
         if result.get("status", "").startswith("error"):
             status_code = 500
             if result.get("status") == "error_bot_format":
@@ -959,9 +913,6 @@ def api_venezolanos_nombres():
             return jsonify(result), status_code
             
         return jsonify(result)
-        
-    except FutureTimeoutError:
-         return jsonify({"status": "error", "message": f"Error interno: Timeout síncrono excedido (max {SYNC_WAIT_TIMEOUT}s). La API de Telegram está saturada o no responde a tiempo para la espera síncrona."}), 504
     except Exception as e:
         return jsonify({"status": "error", "message": f"Error interno: {str(e)}"}), 500
         
