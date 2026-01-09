@@ -5,3 +5,4 @@ aiohttp
 gunicorn
 requests
 PyGithub
+uvicorn
