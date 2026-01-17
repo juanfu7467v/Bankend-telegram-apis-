@@ -61,10 +61,6 @@ def record_bot_failure(bot_id: str):
 app = Flask(__name__)
 CORS(app)
 
-# --- Cache para almacenar temporalmente las respuestas ---
-response_cache = {}
-_cache_lock = asyncio.Lock()
-
 # --- Lógica de Limpieza y Extracción de Datos ---
 def clean_and_extract(raw_text: str):
     if not raw_text:
@@ -379,40 +375,6 @@ def run_telegram_command(command: str):
     finally:
         loop.close()
 
-# --- Rutas HTTP ---
-
-@app.route("/")
-def root():
-    return jsonify({
-        "status": "ok",
-        "message": "Gateway API para LEDER DATA Bot activo (Modo Serverless).",
-        "mode": "serverless",
-        "cost_optimized": True
-    })
-
-@app.route("/status")
-def status():
-    bot_status = {}
-    for bot_id in ALL_BOT_IDS:
-        is_blocked = is_bot_blocked(bot_id)
-        bot_status[bot_id] = {
-            "blocked": is_blocked,
-            "last_fail": bot_fail_tracker.get(bot_id).isoformat() if bot_fail_tracker.get(bot_id) else None
-        }
-    
-    return jsonify({
-        "status": "ready",
-        "session_loaded": bool(SESSION_STRING and SESSION_STRING.strip()),
-        "api_credentials_ok": API_ID != 0 and bool(API_HASH),
-        "bot_status": bot_status,
-        "mode": "on-demand",
-        "instructions": "Telethon se conecta solo cuando llega una consulta y se desconecta después"
-    })
-
-@app.route("/files/<path:filename>")
-def files(filename):
-    return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
-
 # --- Helper para determinar comando ---
 def get_command_and_param(path, request_args):
     command_name_path = path.lstrip('/') 
@@ -495,59 +457,336 @@ def get_command_and_param(path, request_args):
 
     return f"/{command_name} {param}".strip(), None
 
-# --- Definición de TODAS las rutas ---
-ROUTES = [
-    "/sunat", "/sun", "/dni", "/dnif", "/dnidb", "/dnifdb", "/c4", "/dnivaz", "/dnivam",
-    "/dnivel", "/dniveln", "/fa", "/fadb", "/fb", "/fbdb", "/cnv", "/cdef", "/antpen",
-    "/antpol", "/antjud", "/actancc", "/actamcc", "/actadcc", "/osiptel", "/claro",
-    "/entel", "/pro", "/sen", "/sbs", "/tra", "/tremp", "/sue", "/cla", "/sune",
-    "/cun", "/colp", "/mine", "/pasaporte", "/seeker", "/afp", "/bdir", "/meta",
-    "/fis", "/fisdet", "/det", "/rqh", "/antpenv", "/dend", "/dence", "/denpas",
-    "/denci", "/denp", "/denar", "/dencl", "/agv", "/agvp", "/cedula", "/telp",
-    "/fam", "/fam2", "/migrapdf", "/con", "/exd", "/cor", "/dir"
-]
+# --- Rutas HTTP ---
 
-# --- Función generadora de endpoints ---
-def create_endpoint(endpoint_path):
-    def endpoint_handler():
-        command, error = get_command_and_param(endpoint_path, request.args)
-        if error:
-            return jsonify({"status": "error", "message": error}), 400
-        
-        if not command:
-            return jsonify({"status": "error", "message": "Comando no válido"}), 400
-        
-        try:
-            result = run_telegram_command(command)
-            
-            if result.get("status", "").startswith("error"):
-                status_code = 500
-                if result.get("status") == "error_bot_format":
-                    status_code = 400
-                elif result.get("status") == "error_not_found":
-                    status_code = 404
-                elif "timeout" in result.get("message", "").lower():
-                    status_code = 504
-                return jsonify(result), status_code
-                
-            return jsonify(result)
-            
-        except FutureTimeoutError:
-            return jsonify({
-                "status": "error", 
-                "message": f"Error interno: Timeout excedido ({TIMEOUT_TOTAL}s)."
-            }), 504
-        except Exception as e:
-            return jsonify({
-                "status": "error", 
-                "message": f"Error interno: {str(e)}"
-            }), 500
+@app.route("/")
+def root():
+    return jsonify({
+        "status": "ok",
+        "message": "Gateway API para LEDER DATA Bot activo (Modo Serverless).",
+        "mode": "serverless",
+        "cost_optimized": True
+    })
+
+@app.route("/status")
+def status():
+    bot_status = {}
+    for bot_id in ALL_BOT_IDS:
+        is_blocked = is_bot_blocked(bot_id)
+        bot_status[bot_id] = {
+            "blocked": is_blocked,
+            "last_fail": bot_fail_tracker.get(bot_id).isoformat() if bot_fail_tracker.get(bot_id) else None
+        }
     
-    return endpoint_handler
+    return jsonify({
+        "status": "ready",
+        "session_loaded": bool(SESSION_STRING and SESSION_STRING.strip()),
+        "api_credentials_ok": API_ID != 0 and bool(API_HASH),
+        "bot_status": bot_status,
+        "mode": "on-demand",
+        "instructions": "Telethon se conecta solo cuando llega una consulta y se desconecta después"
+    })
 
-# --- Registrar todas las rutas ---
-for route in ROUTES:
-    app.route(route, methods=["GET"])(create_endpoint(route))
+@app.route("/files/<path:filename>")
+def files(filename):
+    return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
+
+# --- Función para manejar endpoints ---
+def handle_api_endpoint(endpoint_path):
+    """Manejador genérico para todos los endpoints de API"""
+    command, error = get_command_and_param(endpoint_path, request.args)
+    if error:
+        return jsonify({"status": "error", "message": error}), 400
+    
+    if not command:
+        return jsonify({"status": "error", "message": "Comando no válido"}), 400
+    
+    try:
+        result = run_telegram_command(command)
+        
+        if result.get("status", "").startswith("error"):
+            status_code = 500
+            if result.get("status") == "error_bot_format":
+                status_code = 400
+            elif result.get("status") == "error_not_found":
+                status_code = 404
+            elif "timeout" in result.get("message", "").lower():
+                status_code = 504
+            return jsonify(result), status_code
+            
+        return jsonify(result)
+        
+    except FutureTimeoutError:
+        return jsonify({
+            "status": "error", 
+            "message": f"Error interno: Timeout excedido ({TIMEOUT_TOTAL}s)."
+        }), 504
+    except Exception as e:
+        return jsonify({
+            "status": "error", 
+            "message": f"Error interno: {str(e)}"
+        }), 500
+
+# --- Definición de TODAS las rutas CON ENDPOINTS ÚNICOS ---
+@app.route("/sunat", methods=["GET"])
+def sunat():
+    return handle_api_endpoint("/sunat")
+
+@app.route("/sun", methods=["GET"])
+def sun():
+    return handle_api_endpoint("/sun")
+
+@app.route("/dni", methods=["GET"])
+def dni():
+    return handle_api_endpoint("/dni")
+
+@app.route("/dnif", methods=["GET"])
+def dnif():
+    return handle_api_endpoint("/dnif")
+
+@app.route("/dnidb", methods=["GET"])
+def dnidb():
+    return handle_api_endpoint("/dnidb")
+
+@app.route("/dnifdb", methods=["GET"])
+def dnifdb():
+    return handle_api_endpoint("/dnifdb")
+
+@app.route("/c4", methods=["GET"])
+def c4():
+    return handle_api_endpoint("/c4")
+
+@app.route("/dnivaz", methods=["GET"])
+def dnivaz():
+    return handle_api_endpoint("/dnivaz")
+
+@app.route("/dnivam", methods=["GET"])
+def dnivam():
+    return handle_api_endpoint("/dnivam")
+
+@app.route("/dnivel", methods=["GET"])
+def dnivel():
+    return handle_api_endpoint("/dnivel")
+
+@app.route("/dniveln", methods=["GET"])
+def dniveln():
+    return handle_api_endpoint("/dniveln")
+
+@app.route("/fa", methods=["GET"])
+def fa():
+    return handle_api_endpoint("/fa")
+
+@app.route("/fadb", methods=["GET"])
+def fadb():
+    return handle_api_endpoint("/fadb")
+
+@app.route("/fb", methods=["GET"])
+def fb():
+    return handle_api_endpoint("/fb")
+
+@app.route("/fbdb", methods=["GET"])
+def fbdb():
+    return handle_api_endpoint("/fbdb")
+
+@app.route("/cnv", methods=["GET"])
+def cnv():
+    return handle_api_endpoint("/cnv")
+
+@app.route("/cdef", methods=["GET"])
+def cdef():
+    return handle_api_endpoint("/cdef")
+
+@app.route("/antpen", methods=["GET"])
+def antpen():
+    return handle_api_endpoint("/antpen")
+
+@app.route("/antpol", methods=["GET"])
+def antpol():
+    return handle_api_endpoint("/antpol")
+
+@app.route("/antjud", methods=["GET"])
+def antjud():
+    return handle_api_endpoint("/antjud")
+
+@app.route("/actancc", methods=["GET"])
+def actancc():
+    return handle_api_endpoint("/actancc")
+
+@app.route("/actamcc", methods=["GET"])
+def actamcc():
+    return handle_api_endpoint("/actamcc")
+
+@app.route("/actadcc", methods=["GET"])
+def actadcc():
+    return handle_api_endpoint("/actadcc")
+
+@app.route("/osiptel", methods=["GET"])
+def osiptel():
+    return handle_api_endpoint("/osiptel")
+
+@app.route("/claro", methods=["GET"])
+def claro():
+    return handle_api_endpoint("/claro")
+
+@app.route("/entel", methods=["GET"])
+def entel():
+    return handle_api_endpoint("/entel")
+
+@app.route("/pro", methods=["GET"])
+def pro():
+    return handle_api_endpoint("/pro")
+
+@app.route("/sen", methods=["GET"])
+def sen():
+    return handle_api_endpoint("/sen")
+
+@app.route("/sbs", methods=["GET"])
+def sbs():
+    return handle_api_endpoint("/sbs")
+
+@app.route("/tra", methods=["GET"])
+def tra():
+    return handle_api_endpoint("/tra")
+
+@app.route("/tremp", methods=["GET"])
+def tremp():
+    return handle_api_endpoint("/tremp")
+
+@app.route("/sue", methods=["GET"])
+def sue():
+    return handle_api_endpoint("/sue")
+
+@app.route("/cla", methods=["GET"])
+def cla():
+    return handle_api_endpoint("/cla")
+
+@app.route("/sune", methods=["GET"])
+def sune():
+    return handle_api_endpoint("/sune")
+
+@app.route("/cun", methods=["GET"])
+def cun():
+    return handle_api_endpoint("/cun")
+
+@app.route("/colp", methods=["GET"])
+def colp():
+    return handle_api_endpoint("/colp")
+
+@app.route("/mine", methods=["GET"])
+def mine():
+    return handle_api_endpoint("/mine")
+
+@app.route("/pasaporte", methods=["GET"])
+def pasaporte():
+    return handle_api_endpoint("/pasaporte")
+
+@app.route("/seeker", methods=["GET"])
+def seeker():
+    return handle_api_endpoint("/seeker")
+
+@app.route("/afp", methods=["GET"])
+def afp():
+    return handle_api_endpoint("/afp")
+
+@app.route("/bdir", methods=["GET"])
+def bdir():
+    return handle_api_endpoint("/bdir")
+
+@app.route("/meta", methods=["GET"])
+def meta():
+    return handle_api_endpoint("/meta")
+
+@app.route("/fis", methods=["GET"])
+def fis():
+    return handle_api_endpoint("/fis")
+
+@app.route("/fisdet", methods=["GET"])
+def fisdet():
+    return handle_api_endpoint("/fisdet")
+
+@app.route("/det", methods=["GET"])
+def det():
+    return handle_api_endpoint("/det")
+
+@app.route("/rqh", methods=["GET"])
+def rqh():
+    return handle_api_endpoint("/rqh")
+
+@app.route("/antpenv", methods=["GET"])
+def antpenv():
+    return handle_api_endpoint("/antpenv")
+
+@app.route("/dend", methods=["GET"])
+def dend():
+    return handle_api_endpoint("/dend")
+
+@app.route("/dence", methods=["GET"])
+def dence():
+    return handle_api_endpoint("/dence")
+
+@app.route("/denpas", methods=["GET"])
+def denpas():
+    return handle_api_endpoint("/denpas")
+
+@app.route("/denci", methods=["GET"])
+def denci():
+    return handle_api_endpoint("/denci")
+
+@app.route("/denp", methods=["GET"])
+def denp():
+    return handle_api_endpoint("/denp")
+
+@app.route("/denar", methods=["GET"])
+def denar():
+    return handle_api_endpoint("/denar")
+
+@app.route("/dencl", methods=["GET"])
+def dencl():
+    return handle_api_endpoint("/dencl")
+
+@app.route("/agv", methods=["GET"])
+def agv():
+    return handle_api_endpoint("/agv")
+
+@app.route("/agvp", methods=["GET"])
+def agvp():
+    return handle_api_endpoint("/agvp")
+
+@app.route("/cedula", methods=["GET"])
+def cedula():
+    return handle_api_endpoint("/cedula")
+
+@app.route("/telp", methods=["GET"])
+def telp():
+    return handle_api_endpoint("/telp")
+
+@app.route("/fam", methods=["GET"])
+def fam():
+    return handle_api_endpoint("/fam")
+
+@app.route("/fam2", methods=["GET"])
+def fam2():
+    return handle_api_endpoint("/fam2")
+
+@app.route("/migrapdf", methods=["GET"])
+def migrapdf():
+    return handle_api_endpoint("/migrapdf")
+
+@app.route("/con", methods=["GET"])
+def con():
+    return handle_api_endpoint("/con")
+
+@app.route("/exd", methods=["GET"])
+def exd():
+    return handle_api_endpoint("/exd")
+
+@app.route("/cor", methods=["GET"])
+def cor():
+    return handle_api_endpoint("/cor")
+
+@app.route("/dir", methods=["GET"])
+def dir():
+    return handle_api_endpoint("/dir")
 
 # --- Rutas especiales ---
 @app.route("/dni_nombres", methods=["GET"])
@@ -630,7 +869,7 @@ def api_venezolanos_nombres():
             "message": f"Error interno: {str(e)}"
         }), 500
 
-# --- Endpoints de mantenimiento (login ya no es necesario con SESSION_STRING) ---
+# --- Endpoints de mantenimiento ---
 @app.route("/login", methods=["GET"])
 def login_info():
     return jsonify({
@@ -647,26 +886,6 @@ def health_check():
         "timestamp": datetime.utcnow().isoformat(),
         "session_configured": bool(SESSION_STRING and SESSION_STRING.strip())
     })
-
-# --- Archivo Procfile (para Railway) ---
-"""
-Crear un archivo llamado "Procfile" (sin extensión) con este contenido:
-
-web: gunicorn app:app --workers 1 --threads 1 --timeout 60 --bind 0.0.0.0:${PORT}
-
-"""
-
-# --- Variables de entorno requeridas ---
-"""
-Variables de entorno REQUERIDAS en Railway:
-
-API_ID=tu_api_id
-API_HASH=tu_api_hash
-SESSION_STRING=tu_session_string_generada_anteriormente
-PUBLIC_URL=https://tu-app.up.railway.app
-PORT=8080
-
-"""
 
 if __name__ == "__main__":
     print("🚀 Iniciando backend en modo SERVERLESS (on-demand)")
