@@ -29,32 +29,33 @@ LEDERDATA_BOT_ID = "@LEDERDATA_OFC_BOT"
 LEDERDATA_BACKUP_BOT_ID = "@lederdata_publico_bot"
 ALL_BOT_IDS = [LEDERDATA_BOT_ID, LEDERDATA_BACKUP_BOT_ID]
 
-TIMEOUT_FAILOVER = 15 
-TIMEOUT_TOTAL = 50 
+# TIMEOUTS ACTUALIZADOS SEGÚN TUS INSTRUCCIONES
+TIMEOUT_PRIMARY = 35  # ~35 segundos para bot principal
+TIMEOUT_BACKUP = 50   # 50 segundos para bot de respaldo
+BOT_BLOCK_HOURS = 4   # 4 horas de bloqueo si falla
 
-# --- Trackeo de Fallos de Bots ---
+# --- Trackeo de Fallos de Bots (ACTUALIZADO) ---
 bot_fail_tracker = {}
-BOT_FAIL_TIMEOUT_HOURS = 6 
 
 def is_bot_blocked(bot_id: str) -> bool:
-    """Verifica si el bot está temporalmente bloqueado por fallos previos."""
+    """Verifica si el bot está bloqueado por fallos recientes."""
     last_fail_time = bot_fail_tracker.get(bot_id)
     if not last_fail_time:
         return False
 
     now = datetime.now()
-    six_hours_ago = now - timedelta(hours=BOT_FAIL_TIMEOUT_HOURS)
+    block_time_ago = now - timedelta(hours=BOT_BLOCK_HOURS)
 
-    if last_fail_time > six_hours_ago:
+    if last_fail_time > block_time_ago:
         return True
     
-    print(f"✅ Bot {bot_id} ha cumplido su tiempo de bloqueo. Desbloqueado.")
+    print(f"✅ Bot {bot_id} ha cumplido su tiempo de bloqueo ({BOT_BLOCK_HOURS}h). Desbloqueado.")
     bot_fail_tracker.pop(bot_id, None)
     return False
 
 def record_bot_failure(bot_id: str):
     """Registra la hora actual como la última hora de fallo del bot."""
-    print(f"🚨 Bot {bot_id} ha fallado y será BLOQUEADO por {BOT_FAIL_TIMEOUT_HOURS} horas.")
+    print(f"🚨 Bot {bot_id} ha fallado y será BLOQUEADO por {BOT_BLOCK_HOURS} horas.")
     bot_fail_tracker[bot_id] = datetime.now()
 
 # --- Aplicación Flask ---
@@ -101,69 +102,81 @@ def clean_and_extract(raw_text: str):
 
     return {"text": text, "fields": fields}
 
-# --- Función Principal para Conexión On-Demand ---
+# --- Función Principal para Conexión On-Demand (CORREGIDA) ---
 async def send_telegram_command(command: str):
     """
-    Función on-demand que:
-    1. Crea un nuevo cliente Telethon
-    2. Se conecta
-    3. Envía el comando
-    4. Espera la respuesta
-    5. Procesa el resultado
-    6. Se desconecta
-    7. Limpia los archivos descargados
+    Función on-demand con lógica SECUENCIAL corregida:
+    1. Intenta con bot principal (35s timeout)
+    2. SI NO RESPONDE: lo bloquea 4 horas
+    3. Intenta con bot de respaldo (50s timeout)
+    4. Retorna inmediatamente al recibir respuesta
     """
     client = None
     try:
-        # 1. Crear el cliente
+        # 1. Verificar credenciales
         if API_ID == 0 or not API_HASH:
             raise Exception("API_ID o API_HASH no configurados.")
         
         if not SESSION_STRING or not SESSION_STRING.strip():
             raise Exception("SESSION_STRING no configurada. Se requiere sesión válida.")
         
+        # 2. Crear cliente
         session = StringSession(SESSION_STRING)
         client = TelegramClient(session, API_ID, API_HASH)
         
-        # 2. Conectar
+        # 3. Conectar
         await client.connect()
         
         if not await client.is_user_authorized():
             raise Exception("Cliente no autorizado. La sesión puede haber expirado.")
         
-        # 3. Extraer DNI para tracking
+        # 4. Extraer DNI para tracking
         dni_match = re.search(r"/\w+\s+(\d{8})", command)
         dni = dni_match.group(1) if dni_match else None
         
-        # 4. Determinar bots a usar
-        bots_to_try = []
-        for bot_id in ALL_BOT_IDS:
-            if not is_bot_blocked(bot_id):
-                bots_to_try.append(bot_id)
+        # 5. Determinar orden de bots según bloqueos
+        # Siempre intentar principal primero, luego respaldo
+        bots_order = []
         
-        if not bots_to_try:
+        if not is_bot_blocked(LEDERDATA_BOT_ID):
+            bots_order.append(LEDERDATA_BOT_ID)
+        
+        if not is_bot_blocked(LEDERDATA_BACKUP_BOT_ID):
+            bots_order.append(LEDERDATA_BACKUP_BOT_ID)
+        
+        if not bots_order:
             raise Exception("Todos los bots están temporalmente bloqueados.")
         
-        # Variables para almacenar respuestas
-        received_messages = []
-        message_event = asyncio.Event()
+        print(f"🔍 Orden de intentos: {bots_order}")
         
-        # 5. Handler temporal para capturar respuestas
+        # 6. Variables para capturar respuestas
+        all_received_messages = []  # Para múltiples mensajes del MISMO bot
+        current_bot_response_complete = asyncio.Event()
+        stop_collecting = asyncio.Event()
+        
+        # 7. Handler temporal para capturar respuestas
         @client.on(events.NewMessage(incoming=True))
         async def temp_handler(event):
+            # Si ya tenemos respuesta completa, ignorar nuevos mensajes
+            if stop_collecting.is_set():
+                return
+                
             try:
-                # Verificar si el mensaje viene de uno de los bots
-                sender_is_bot = False
-                for bot_name in ALL_BOT_IDS:
+                # Verificar si el mensaje viene de un bot que estamos probando
+                sender_is_current_bot = False
+                current_bot_entity = None
+                
+                for bot_id in bots_order:
                     try:
-                        entity = await client.get_entity(bot_name)
+                        entity = await client.get_entity(bot_id)
                         if event.sender_id == entity.id:
-                            sender_is_bot = True
+                            sender_is_current_bot = True
+                            current_bot_entity = entity
                             break
                     except:
                         continue
                 
-                if not sender_is_bot:
+                if not sender_is_current_bot:
                     return
                 
                 raw_text = event.raw_text or ""
@@ -214,75 +227,122 @@ async def send_telegram_command(command: str):
                     "date": event.message.date.isoformat() if getattr(event, "message", None) else datetime.utcnow().isoformat(),
                     "message": cleaned["text"],
                     "fields": cleaned["fields"],
-                    "urls": msg_urls 
+                    "urls": msg_urls,
+                    "bot_id": current_bot_entity.id if current_bot_entity else None
                 }
                 
-                received_messages.append(msg_obj)
+                all_received_messages.append(msg_obj)
+                print(f"📥 Mensaje recibido de bot: {len(msg_obj['message'])} chars, {len(msg_urls)} archivos")
                 
-                # Detectar si es una respuesta final
-                is_final = (
-                    "Por favor, usa el formato correcto" in msg_obj["message"] or 
-                    msg_obj["fields"].get("not_found", False) or
-                    len(received_messages) >= 3  # Límite de mensajes por consulta
-                )
+                # NO detener inmediatamente - esperar posiblemente múltiples mensajes
+                # Solo detener si es error de formato o "no encontrado"
+                if ("Por favor, usa el formato correcto" in msg_obj["message"] or 
+                    msg_obj["fields"].get("not_found", False)):
+                    print("⚠️ Respuesta de error detectada, deteniendo colección")
+                    current_bot_response_complete.set()
                 
-                if is_final:
-                    message_event.set()
-                    
             except Exception as e:
                 print(f"Error en handler temporal: {e}")
         
-        # 6. Intentar con cada bot disponible
-        final_result = None
-        for attempt, current_bot_id in enumerate(bots_to_try, 1):
-            print(f"📡 Enviando comando (Intento {attempt}) a {current_bot_id}: {command}")
+        # 8. Intentar SECUENCIALMENTE con cada bot
+        for attempt, current_bot_id in enumerate(bots_order, 1):
+            print(f"\n🎯 Intento {attempt}: Enviando a {current_bot_id}")
+            print(f"   Comando: {command}")
+            
+            # Resetear para este intento
+            all_received_messages = []
+            current_bot_response_complete.clear()
+            stop_collecting.clear()
             
             try:
-                # Resetear variables para cada intento
-                received_messages = []
-                message_event.clear()
+                # Determinar timeout según bot
+                timeout = TIMEOUT_PRIMARY if current_bot_id == LEDERDATA_BOT_ID else TIMEOUT_BACKUP
+                print(f"   Timeout configurado: {timeout}s")
                 
                 # Enviar comando
                 await client.send_message(current_bot_id, command)
                 
-                # Esperar respuesta con timeout
+                # Timer para múltiples mensajes
+                start_time = time.time()
+                
+                # Esperar respuesta con lógica mejorada
                 try:
-                    await asyncio.wait_for(message_event.wait(), timeout=TIMEOUT_FAILOVER if attempt == 1 else TIMEOUT_TOTAL)
+                    # Esperar al menos un mensaje
+                    while True:
+                        # Esperar máximo el timeout total
+                        elapsed = time.time() - start_time
+                        if elapsed > timeout:
+                            raise asyncio.TimeoutError(f"Timeout de {timeout}s alcanzado")
+                        
+                        # Verificar si ya tenemos mensajes
+                        if all_received_messages:
+                            # Si han pasado 3 segundos desde el último mensaje, asumir que terminó
+                            if time.time() - start_time > 3:
+                                print(f"   {len(all_received_messages)} mensajes recibidos, asumiendo respuesta completa")
+                                current_bot_response_complete.set()
+                                break
+                        
+                        # Esperar un poco y verificar de nuevo
+                        await asyncio.sleep(0.5)
+                        
+                        # Verificar si el handler ya marcó como completo (error de formato, etc.)
+                        if current_bot_response_complete.is_set():
+                            break
+                
                 except asyncio.TimeoutError:
-                    if attempt == 1 and len(bots_to_try) > 1:
-                        print(f"⌛ Timeout de {current_bot_id}. Intentando con siguiente bot...")
+                    # TIMEOUT - este bot no respondió
+                    print(f"⏰ TIMEOUT: {current_bot_id} no respondió en {timeout}s")
+                    
+                    # Si es el bot principal, bloquearlo por 4 horas
+                    if current_bot_id == LEDERDATA_BOT_ID:
+                        record_bot_failure(LEDERDATA_BOT_ID)
+                        print(f"🔒 Bot principal bloqueado por {BOT_BLOCK_HOURS} horas")
+                    
+                    # Si hay más bots para probar, continuar
+                    if attempt < len(bots_order):
+                        print(f"🔄 Pasando al siguiente bot...")
                         continue
                     else:
-                        raise Exception(f"Tiempo de espera agotado ({TIMEOUT_FAILOVER if attempt == 1 else TIMEOUT_TOTAL}s)")
+                        # No hay más bots, lanzar error
+                        raise Exception(f"Ningún bot respondió. Último timeout: {timeout}s")
+                
+                # 9. SI LLEGAMOS AQUÍ, EL BOT RESPONDIÓ
+                print(f"✅ {current_bot_id} respondió con {len(all_received_messages)} mensajes")
                 
                 # Procesar respuestas recibidas
-                if received_messages:
+                if all_received_messages:
+                    # Marcar para detener cualquier espera futura
+                    stop_collecting.set()
+                    
                     # Si recibimos error de formato
-                    if "Por favor, usa el formato correcto" in received_messages[0]["message"]:
+                    if "Por favor, usa el formato correcto" in all_received_messages[0]["message"]:
                         return {
                             "status": "error_bot_format", 
-                            "message": "Formato de consulta incorrecto. " + received_messages[0]["message"],
+                            "message": "Formato de consulta incorrecto. " + all_received_messages[0]["message"],
                             "bot_used": current_bot_id
                         }
                     
                     # Si es "no encontrado"
-                    if received_messages[0]["fields"].get("not_found", False):
+                    if all_received_messages[0]["fields"].get("not_found", False):
                         return {
                             "status": "error_not_found", 
                             "message": "No se encontraron resultados para dicha consulta. Intenta con otro dato.",
                             "bot_used": current_bot_id
                         }
                     
-                    # Consolidar múltiples mensajes
-                    final_msg = received_messages[0].copy()
-                    if len(received_messages) > 1:
-                        final_msg["message"] = "\n---\n".join([msg["message"] for msg in received_messages])
+                    # Consolidar múltiples mensajes del MISMO bot
+                    final_msg = all_received_messages[0].copy()
+                    
+                    # Combinar texto de todos los mensajes
+                    if len(all_received_messages) > 1:
+                        final_msg["message"] = "\n---\n".join([msg["message"] for msg in all_received_messages])
                         
+                        # Consolidar URLs de todos los mensajes
                         consolidated_urls = {}
                         type_map = {"rostro": "ROSTRO", "huella": "HUELLA", "firma": "FIRMA", 
                                    "adverso": "ADVERSO", "reverso": "REVERSO"}
                         
-                        for msg in received_messages:
+                        for msg in all_received_messages:
                             for url_obj in msg.get("urls", []):
                                 key_type = url_obj["type"].lower()
                                 key = type_map.get(key_type)
@@ -321,24 +381,38 @@ async def send_telegram_command(command: str):
                         final_json["ruc"] = ruc_val
                         final_json["fields"].pop("ruc", None)
                     
+                    # LIMPIAR handler de eventos para evitar fugas
+                    client.remove_event_handler(temp_handler)
+                    
                     return final_json
+                else:
+                    # Caso raro: event.set() pero sin mensajes
+                    raise Exception("Respuesta marcada como completa pero sin mensajes recibidos")
                     
             except UserBlockedError:
-                print(f"❌ Bot {current_bot_id} bloqueado. Registrando fallo...")
+                print(f"❌ {current_bot_id} bloqueado por el usuario")
                 record_bot_failure(current_bot_id)
-                if attempt < len(bots_to_try):
+                
+                if attempt < len(bots_order):
                     continue
                 else:
-                    raise Exception("Todos los bots están bloqueados temporalmente.")
+                    raise Exception("Todos los bots están bloqueados")
                     
             except Exception as e:
-                print(f"❌ Error con bot {current_bot_id}: {e}")
-                if attempt < len(bots_to_try):
+                print(f"❌ Error con {current_bot_id}: {str(e)[:100]}")
+                
+                # Si es error grave y es el bot principal, bloquearlo
+                if "blocked" in str(e).lower() and current_bot_id == LEDERDATA_BOT_ID:
+                    record_bot_failure(LEDERDATA_BOT_ID)
+                
+                if attempt < len(bots_order):
+                    print(f"🔄 Intentando con siguiente bot...")
                     continue
                 else:
                     raise e
         
-        raise Exception("No se pudo obtener respuesta de ningún bot")
+        # No deberíamos llegar aquí
+        raise Exception("Flujo inesperado - no se obtuvo respuesta")
         
     except Exception as e:
         return {
@@ -347,21 +421,26 @@ async def send_telegram_command(command: str):
         }
         
     finally:
-        # 7. Limpiar siempre
+        # 10. Limpieza final
         if client:
             try:
                 await client.disconnect()
+                print("🔌 Cliente desconectado")
             except:
                 pass
         
         # Limpiar archivos descargados más antiguos de 5 minutos
         try:
             now = time.time()
+            cleaned_count = 0
             for filename in os.listdir(DOWNLOAD_DIR):
                 filepath = os.path.join(DOWNLOAD_DIR, filename)
                 if os.path.isfile(filepath):
                     if now - os.path.getmtime(filepath) > 300:  # 5 minutos
                         os.remove(filepath)
+                        cleaned_count += 1
+            if cleaned_count > 0:
+                print(f"🧹 Limpiados {cleaned_count} archivos antiguos")
         except Exception as e:
             print(f"⚠️ Error limpiando archivos: {e}")
 
@@ -473,9 +552,11 @@ def status():
     bot_status = {}
     for bot_id in ALL_BOT_IDS:
         is_blocked = is_bot_blocked(bot_id)
+        last_fail = bot_fail_tracker.get(bot_id)
         bot_status[bot_id] = {
             "blocked": is_blocked,
-            "last_fail": bot_fail_tracker.get(bot_id).isoformat() if bot_fail_tracker.get(bot_id) else None
+            "last_fail": last_fail.isoformat() if last_fail else None,
+            "block_hours": BOT_BLOCK_HOURS if is_blocked else 0
         }
     
     return jsonify({
@@ -484,7 +565,11 @@ def status():
         "api_credentials_ok": API_ID != 0 and bool(API_HASH),
         "bot_status": bot_status,
         "mode": "on-demand",
-        "instructions": "Telethon se conecta solo cuando llega una consulta y se desconecta después"
+        "timeouts": {
+            "primary_bot": TIMEOUT_PRIMARY,
+            "backup_bot": TIMEOUT_BACKUP,
+            "block_hours": BOT_BLOCK_HOURS
+        }
     })
 
 @app.route("/files/<path:filename>")
@@ -519,7 +604,7 @@ def handle_api_endpoint(endpoint_path):
     except FutureTimeoutError:
         return jsonify({
             "status": "error", 
-            "message": f"Error interno: Timeout excedido ({TIMEOUT_TOTAL}s)."
+            "message": f"Error interno: Timeout excedido ({TIMEOUT_BACKUP}s)."
         }), 504
     except Exception as e:
         return jsonify({
@@ -527,7 +612,8 @@ def handle_api_endpoint(endpoint_path):
             "message": f"Error interno: {str(e)}"
         }), 500
 
-# --- Definición de TODAS las rutas CON ENDPOINTS ÚNICOS ---
+# --- DEFINICIÓN DE TODAS LAS RUTAS (TODAS MANTENIDAS) ---
+
 @app.route("/sunat", methods=["GET"])
 def sunat():
     return handle_api_endpoint("/sunat")
@@ -824,7 +910,7 @@ def api_dni_nombres():
     except FutureTimeoutError:
         return jsonify({
             "status": "error", 
-            "message": f"Error interno: Timeout excedido ({TIMEOUT_TOTAL}s)."
+            "message": f"Error interno: Timeout excedido ({TIMEOUT_BACKUP}s)."
         }), 504
     except Exception as e:
         return jsonify({
@@ -861,7 +947,7 @@ def api_venezolanos_nombres():
     except FutureTimeoutError:
         return jsonify({
             "status": "error", 
-            "message": f"Error interno: Timeout excedido ({TIMEOUT_TOTAL}s)."
+            "message": f"Error interno: Timeout excedido ({TIMEOUT_BACKUP}s)."
         }), 504
     except Exception as e:
         return jsonify({
@@ -887,8 +973,29 @@ def health_check():
         "session_configured": bool(SESSION_STRING and SESSION_STRING.strip())
     })
 
+@app.route("/debug/bots", methods=["GET"])
+def debug_bots():
+    """Endpoint de depuración para ver estado de bots"""
+    return jsonify({
+        "primary_bot": {
+            "id": LEDERDATA_BOT_ID,
+            "blocked": is_bot_blocked(LEDERDATA_BOT_ID),
+            "last_fail": bot_fail_tracker.get(LEDERDATA_BOT_ID, {}),
+            "timeout": TIMEOUT_PRIMARY
+        },
+        "backup_bot": {
+            "id": LEDERDATA_BACKUP_BOT_ID,
+            "blocked": is_bot_blocked(LEDERDATA_BACKUP_BOT_ID),
+            "last_fail": bot_fail_tracker.get(LEDERDATA_BACKUP_BOT_ID, {}),
+            "timeout": TIMEOUT_BACKUP
+        },
+        "block_hours": BOT_BLOCK_HOURS
+    })
+
 if __name__ == "__main__":
     print("🚀 Iniciando backend en modo SERVERLESS (on-demand)")
     print("📊 Modo optimizado para costos (<5 USD/mes)")
     print("🔗 Telethon se conecta solo cuando recibe consultas")
+    print(f"⏰ Timeouts: Principal={TIMEOUT_PRIMARY}s, Respaldo={TIMEOUT_BACKUP}s")
+    print(f"🔒 Bloqueo bot fallado: {BOT_BLOCK_HOURS} horas")
     app.run(host="0.0.0.0", port=PORT, debug=False)
