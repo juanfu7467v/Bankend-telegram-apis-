@@ -4,6 +4,7 @@ import asyncio
 import traceback
 import time
 import json
+import mimetypes
 from datetime import datetime, timezone, timedelta
 from urllib.parse import unquote
 from concurrent.futures import TimeoutError as FutureTimeoutError 
@@ -20,6 +21,22 @@ API_HASH = os.getenv("API_HASH", "")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "https://consulta-pe-bot.up.railway.app").rstrip("/")
 SESSION_STRING = os.getenv("SESSION_STRING", None)
 PORT = int(os.getenv("PORT", 8080))
+
+# --- Configuración de Firebase ---
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "consulta-pe-abf99")
+FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL", "firebase-adminsdk-fbsvc@consulta-pe-abf99.iam.gserviceaccount.com")
+FIREBASE_PRIVATE_KEY = os.getenv("FIREBASE_PRIVATE_KEY", "").replace("\\n", "\n")
+FIREBASE_STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET", "consulta-pe-abf99.appspot.com")
+
+# Importación condicional de Firebase
+try:
+    from google.cloud import storage
+    firebase_available = True
+    print("✅ Firebase SDK disponible")
+except ImportError:
+    print("⚠️ Firebase SDK no disponible. Instala: pip install google-cloud-storage")
+    firebase_available = False
+    storage = None
 
 # --- Configuración Interna ---
 DOWNLOAD_DIR = "downloads"
@@ -57,6 +74,164 @@ def record_bot_failure(bot_id: str):
     """Registra la hora actual como la última hora de fallo del bot."""
     print(f"🚨 Bot {bot_id} ha fallado y será BLOQUEADO por {BOT_BLOCK_HOURS} horas.")
     bot_fail_tracker[bot_id] = datetime.now()
+
+# --- Funciones de Firebase Storage ---
+def get_storage_client():
+    """Obtiene el cliente de Firebase Storage"""
+    if not firebase_available:
+        return None
+    try:
+        client = storage.Client()
+        return client
+    except Exception as e:
+        print(f"❌ Error al conectar con Firebase Storage: {e}")
+        return None
+
+def archivos_existentes_en_storage(consulta_id: str, tipo_consulta: str = None):
+    """
+    Revisa si los archivos ya existen en Firebase Storage
+    """
+    if not firebase_available:
+        return None
+    
+    try:
+        client = get_storage_client()
+        if not client:
+            return None
+        
+        bucket = client.bucket(FIREBASE_STORAGE_BUCKET)
+        
+        # Construir el prefijo según tipo de consulta
+        if tipo_consulta:
+            prefix = f"resultados/{tipo_consulta}/{consulta_id}/"
+        else:
+            # Buscar en cualquier tipo de consulta
+            prefixes = [f"resultados/{tipo}/{consulta_id}/" for tipo in ["DNI_virtual", "SBS", "Denuncias", "general"]]
+            all_blobs = []
+            for prefix in prefixes:
+                blobs = list(bucket.list_blobs(prefix=prefix))
+                if blobs:
+                    all_blobs.extend(blobs)
+            
+            if all_blobs:
+                return [blob.public_url for blob in all_blobs]
+            return None
+        
+        blobs = list(bucket.list_blobs(prefix=prefix))
+        if blobs:
+            urls = []
+            for blob in blobs:
+                # Asegurar que la URL sea pública
+                if not blob.public_url:
+                    blob.make_public()
+                urls.append(blob.public_url)
+            return urls
+        return None
+        
+    except Exception as e:
+        print(f"⚠️ Error al verificar archivos en Storage: {e}")
+        return None
+
+def subir_archivos_a_storage(files_data, consulta_id: str, tipo_consulta: str = None):
+    """
+    Sube todos los archivos recibidos a Firebase Storage
+    files_data: lista de tuplas (filename, file_content, content_type)
+    """
+    if not firebase_available:
+        return None
+    
+    try:
+        client = get_storage_client()
+        if not client:
+            return None
+        
+        bucket = client.bucket(FIREBASE_STORAGE_BUCKET)
+        urls = []
+        
+        # Determinar tipo de consulta para organización
+        if not tipo_consulta:
+            tipo_consulta = determinar_tipo_consulta_por_comando(request.path)
+        
+        for idx, (filename, file_content, content_type) in enumerate(files_data):
+            try:
+                # Obtener extensión del archivo
+                file_ext = os.path.splitext(filename)[1] if filename else '.jpg'
+                if not file_ext or file_ext == '.':
+                    # Determinar extensión basada en content_type
+                    if content_type:
+                        if 'pdf' in content_type.lower():
+                            file_ext = '.pdf'
+                        elif 'png' in content_type.lower():
+                            file_ext = '.png'
+                        elif 'jpeg' in content_type.lower() or 'jpg' in content_type.lower():
+                            file_ext = '.jpg'
+                        else:
+                            file_ext = '.bin'
+                
+                # Nombre único por archivo
+                safe_filename = re.sub(r'[^\w\-\.]', '_', filename or f"file_{idx}")
+                unique_filename = f"{consulta_id}_{idx}_{safe_filename}"
+                
+                # Ruta organizada en Storage
+                storage_path = f"resultados/{tipo_consulta}/{consulta_id}/{unique_filename}"
+                
+                # Subir archivo
+                blob = bucket.blob(storage_path)
+                
+                # Configurar metadata
+                blob.content_type = content_type or mimetypes.guess_type(filename)[0] if filename else 'application/octet-stream'
+                
+                # Subir contenido
+                blob.upload_from_string(file_content)
+                
+                # Hacer público
+                blob.make_public()
+                
+                urls.append({
+                    "url": blob.public_url,
+                    "filename": unique_filename,
+                    "type": content_type or "unknown"
+                })
+                
+                print(f"✅ Archivo subido a Firebase: {storage_path}")
+                
+            except Exception as e:
+                print(f"⚠️ Error subiendo archivo {idx}: {e}")
+                continue
+        
+        return urls
+        
+    except Exception as e:
+        print(f"❌ Error general subiendo archivos a Storage: {e}")
+        return None
+
+def determinar_tipo_consulta_por_comando(comando_path: str):
+    """Determina el tipo de consulta basado en el endpoint"""
+    comando = comando_path.lstrip('/').split('/')[0]
+    
+    # Mapeo de comandos a tipos de consulta
+    tipo_por_comando = {
+        'dni': 'DNI_virtual',
+        'dnif': 'DNI_virtual',
+        'dnidb': 'DNI_virtual',
+        'dnifdb': 'DNI_virtual',
+        'sbs': 'SBS',
+        'denuncia': 'Denuncias',
+        'dence': 'Denuncias',
+        'denpas': 'Denuncias',
+        'denci': 'Denuncias',
+        'denp': 'Denuncias',
+        'denar': 'Denuncias',
+        'dencl': 'Denuncias',
+        'migrapdf': 'Migraciones',
+        'sunat': 'SUNAT',
+        'sun': 'SUNAT',
+        'antpen': 'Antecedentes',
+        'antpol': 'Antecedentes',
+        'antjud': 'Antecedentes'
+    }
+    
+    return tipo_por_comando.get(comando, 'general')
 
 # --- Aplicación Flask ---
 app = Flask(__name__)
@@ -102,14 +277,10 @@ def clean_and_extract(raw_text: str):
 
     return {"text": text, "fields": fields}
 
-# --- Función Principal para Conexión On-Demand (CORREGIDA) ---
-async def send_telegram_command(command: str):
+# --- Función Principal para Conexión On-Demand (MODIFICADA para múltiples archivos) ---
+async def send_telegram_command(command: str, consulta_id: str = None, endpoint_path: str = None):
     """
-    Función on-demand con lógica SECUENCIAL corregida:
-    1. Intenta con bot principal (35s timeout)
-    2. SI NO RESPONDE: lo bloquea 4 horas
-    3. Intenta con bot de respaldo (50s timeout)
-    4. Retorna inmediatamente al recibir respuesta
+    Función on-demand con soporte para múltiples archivos y Firebase Storage
     """
     client = None
     try:
@@ -131,11 +302,32 @@ async def send_telegram_command(command: str):
             raise Exception("Cliente no autorizado. La sesión puede haber expirado.")
         
         # 4. Extraer DNI para tracking
-        dni_match = re.search(r"/\w+\s+(\d{8})", command)
+        dni_match = re.search(r"/\w+\s+(\d{8,11})", command)
         dni = dni_match.group(1) if dni_match else None
         
-        # 5. Determinar orden de bots según bloqueos
-        # Siempre intentar principal primero, luego respaldo
+        # 5. Determinar tipo de consulta para Firebase
+        tipo_consulta = determinar_tipo_consulta_por_comando(endpoint_path) if endpoint_path else "general"
+        
+        # 6. Generar consulta_id si no se proporciona
+        if not consulta_id:
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            consulta_id = f"{tipo_consulta}_{dni or 'unknown'}_{timestamp}" if dni else f"{tipo_consulta}_{timestamp}"
+        
+        # 7. Verificar si ya existen archivos en Firebase Storage
+        urls_existentes = archivos_existentes_en_storage(consulta_id, tipo_consulta)
+        if urls_existentes and firebase_available:
+            print(f"✅ Archivos encontrados en Firebase Storage para consulta {consulta_id}")
+            # Retornar estructura similar a la que espera el bot
+            return {
+                "status": "ok",
+                "message": "Consulta recuperada de cache",
+                "fields": {"dni": dni} if dni else {},
+                "urls": {f"file_{i}": url for i, url in enumerate(urls_existentes)},
+                "from_cache": True,
+                "consulta_id": consulta_id
+            }
+        
+        # 8. Determinar orden de bots según bloqueos
         bots_order = []
         
         if not is_bot_blocked(LEDERDATA_BOT_ID):
@@ -149,12 +341,13 @@ async def send_telegram_command(command: str):
         
         print(f"🔍 Orden de intentos: {bots_order}")
         
-        # 6. Variables para capturar respuestas
+        # 9. Variables para capturar respuestas
         all_received_messages = []  # Para múltiples mensajes del MISMO bot
+        all_files_data = []  # Para almacenar archivos para Firebase
         current_bot_response_complete = asyncio.Event()
         stop_collecting = asyncio.Event()
         
-        # 7. Handler temporal para capturar respuestas
+        # 10. Handler temporal para capturar respuestas
         @client.on(events.NewMessage(incoming=True))
         async def temp_handler(event):
             # Si ya tenemos respuesta completa, ignorar nuevos mensajes
@@ -199,27 +392,54 @@ async def send_telegram_command(command: str):
                         timestamp_str = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
                         
                         for i, media in enumerate(media_list):
-                            file_ext = '.file'
-                            is_photo = False
-                            
-                            if hasattr(media, 'document') and hasattr(media.document, 'attributes'):
-                                file_ext = os.path.splitext(getattr(media.document, 'file_name', 'file'))[1]
-                            elif isinstance(media, MessageMediaPhoto) or (hasattr(media, 'photo') and media.photo):
-                                file_ext = '.jpg'
-                                is_photo = True
+                            try:
+                                file_ext = '.file'
+                                is_photo = False
+                                content_type = None
                                 
-                            dni_part = f"_{cleaned['fields'].get('dni')}" if cleaned["fields"].get("dni") else ""
-                            type_part = f"_{cleaned['fields'].get('photo_type')}" if cleaned['fields'].get('photo_type') else ""
-                            unique_filename = f"{timestamp_str}_{event.message.id}{dni_part}{type_part}_{i}{file_ext}"
-                            
-                            saved_path = await client.download_media(event.message, file=os.path.join(DOWNLOAD_DIR, unique_filename))
-                            
-                            url_obj = {
-                                "url": f"{PUBLIC_URL}/files/{os.path.basename(saved_path)}", 
-                                "type": cleaned['fields'].get('photo_type', 'image' if is_photo else 'document'),
-                                "text_context": raw_text.split('\n')[0].strip()
-                            }
-                            msg_urls.append(url_obj)
+                                if hasattr(media, 'document') and hasattr(media.document, 'attributes'):
+                                    file_name = getattr(media.document, 'file_name', 'file')
+                                    file_ext = os.path.splitext(file_name)[1]
+                                    # Determinar content_type
+                                    if 'pdf' in file_name.lower() or file_ext == '.pdf':
+                                        content_type = 'application/pdf'
+                                    elif 'jpg' in file_name.lower() or 'jpeg' in file_name.lower() or file_ext in ['.jpg', '.jpeg']:
+                                        content_type = 'image/jpeg'
+                                    elif 'png' in file_name.lower() or file_ext == '.png':
+                                        content_type = 'image/png'
+                                    else:
+                                        content_type = 'application/octet-stream'
+                                elif isinstance(media, MessageMediaPhoto) or (hasattr(media, 'photo') and media.photo):
+                                    file_ext = '.jpg'
+                                    is_photo = True
+                                    content_type = 'image/jpeg'
+                                    
+                                dni_part = f"_{cleaned['fields'].get('dni')}" if cleaned["fields"].get("dni") else ""
+                                type_part = f"_{cleaned['fields'].get('photo_type')}" if cleaned['fields'].get('photo_type') else ""
+                                unique_filename = f"{timestamp_str}_{event.message.id}{dni_part}{type_part}_{i}{file_ext}"
+                                
+                                # Descargar archivo
+                                saved_path = await client.download_media(event.message, file=os.path.join(DOWNLOAD_DIR, unique_filename))
+                                
+                                # Leer contenido para Firebase
+                                if os.path.exists(saved_path):
+                                    with open(saved_path, 'rb') as f:
+                                        file_content = f.read()
+                                    
+                                    # Guardar para subir a Firebase
+                                    all_files_data.append((unique_filename, file_content, content_type))
+                                
+                                # URL local
+                                url_obj = {
+                                    "url": f"{PUBLIC_URL}/files/{os.path.basename(saved_path)}", 
+                                    "type": cleaned['fields'].get('photo_type', 'image' if is_photo else 'document'),
+                                    "text_context": raw_text.split('\n')[0].strip()
+                                }
+                                msg_urls.append(url_obj)
+                                
+                            except Exception as e:
+                                print(f"Error procesando archivo {i}: {e}")
+                                continue
                 
                 msg_obj = {
                     "chat_id": getattr(event, "chat_id", None),
@@ -244,7 +464,7 @@ async def send_telegram_command(command: str):
             except Exception as e:
                 print(f"Error en handler temporal: {e}")
         
-        # 8. Intentar SECUENCIALMENTE con cada bot
+        # 11. Intentar SECUENCIALMENTE con cada bot
         for attempt, current_bot_id in enumerate(bots_order, 1):
             print(f"\n🎯 Intento {attempt}: Enviando a {current_bot_id}")
             print(f"   Comando: {command}")
@@ -306,7 +526,7 @@ async def send_telegram_command(command: str):
                         # No hay más bots, lanzar error
                         raise Exception(f"Ningún bot respondió. Último timeout: {timeout}s")
                 
-                # 9. SI LLEGAMOS AQUÍ, EL BOT RESPONDIÓ
+                # 12. SI LLEGAMOS AQUÍ, EL BOT RESPONDIÓ
                 print(f"✅ {current_bot_id} respondió con {len(all_received_messages)} mensajes")
                 
                 # Procesar respuestas recibidas
@@ -367,7 +587,8 @@ async def send_telegram_command(command: str):
                         "message": final_msg["message"],
                         "fields": final_msg["fields"],
                         "urls": final_msg.get("urls", {}),
-                        "status": "ok"
+                        "status": "ok",
+                        "consulta_id": consulta_id
                     }
                     
                     # Mover DNI/RUC al nivel superior si existen
@@ -380,6 +601,28 @@ async def send_telegram_command(command: str):
                     if ruc_val:
                         final_json["ruc"] = ruc_val
                         final_json["fields"].pop("ruc", None)
+                    
+                    # 13. SUBIR ARCHIVOS A FIREBASE STORAGE
+                    if all_files_data and firebase_available:
+                        try:
+                            firebase_urls = subir_archivos_a_storage(all_files_data, consulta_id, tipo_consulta)
+                            if firebase_urls:
+                                # Agregar URLs de Firebase a la respuesta
+                                firebase_url_dict = {}
+                                for i, url_info in enumerate(firebase_urls):
+                                    firebase_url_dict[f"firebase_{i}"] = url_info["url"]
+                                
+                                # Combinar URLs locales con Firebase
+                                if final_json.get("urls"):
+                                    final_json["urls"].update(firebase_url_dict)
+                                else:
+                                    final_json["urls"] = firebase_url_dict
+                                
+                                final_json["firebase_uploaded"] = True
+                                print(f"✅ {len(firebase_urls)} archivos subidos a Firebase Storage")
+                        except Exception as e:
+                            print(f"⚠️ Error subiendo a Firebase (no crítico): {e}")
+                            final_json["firebase_uploaded"] = False
                     
                     # LIMPIAR handler de eventos para evitar fugas
                     client.remove_event_handler(temp_handler)
@@ -421,7 +664,7 @@ async def send_telegram_command(command: str):
         }
         
     finally:
-        # 10. Limpieza final
+        # 14. Limpieza final
         if client:
             try:
                 await client.disconnect()
@@ -445,12 +688,12 @@ async def send_telegram_command(command: str):
             print(f"⚠️ Error limpiando archivos: {e}")
 
 # --- Wrapper síncrono para Flask ---
-def run_telegram_command(command: str):
+def run_telegram_command(command: str, consulta_id: str = None, endpoint_path: str = None):
     """Ejecuta la función asíncrona desde Flask (síncrono)"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        return loop.run_until_complete(send_telegram_command(command))
+        return loop.run_until_complete(send_telegram_command(command, consulta_id, endpoint_path))
     finally:
         loop.close()
 
@@ -542,8 +785,9 @@ def get_command_and_param(path, request_args):
 def root():
     return jsonify({
         "status": "ok",
-        "message": "Gateway API para LEDER DATA Bot activo (Modo Serverless).",
+        "message": "Gateway API para LEDER DATA Bot activo (Modo Serverless con Firebase).",
         "mode": "serverless",
+        "firebase_available": firebase_available,
         "cost_optimized": True
     })
 
@@ -563,6 +807,8 @@ def status():
         "status": "ready",
         "session_loaded": bool(SESSION_STRING and SESSION_STRING.strip()),
         "api_credentials_ok": API_ID != 0 and bool(API_HASH),
+        "firebase_available": firebase_available,
+        "firebase_bucket": FIREBASE_STORAGE_BUCKET if firebase_available else "no configurado",
         "bot_status": bot_status,
         "mode": "on-demand",
         "timeouts": {
@@ -587,7 +833,16 @@ def handle_api_endpoint(endpoint_path):
         return jsonify({"status": "error", "message": "Comando no válido"}), 400
     
     try:
-        result = run_telegram_command(command)
+        # Generar ID único para esta consulta
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        command_name = endpoint_path.lstrip('/').split('/')[0]
+        dni_match = re.search(r"/(\d{8,11})", command)
+        dni = dni_match.group(1) if dni_match else "unknown"
+        
+        consulta_id = f"{command_name}_{dni}_{timestamp}"
+        
+        # Ejecutar comando
+        result = run_telegram_command(command, consulta_id, endpoint_path)
         
         if result.get("status", "").startswith("error"):
             status_code = 500
@@ -894,7 +1149,11 @@ def api_dni_nombres():
     command = f"/nm {formatted_nombres}|{formatted_apepaterno}|{formatted_apematerno}"
     
     try:
-        result = run_telegram_command(command)
+        # Generar ID único para esta consulta
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        consulta_id = f"dni_nombres_{timestamp}"
+        
+        result = run_telegram_command(command, consulta_id, "/dni_nombres")
         if result.get("status", "").startswith("error"):
             status_code = 500
             if result.get("status") == "error_bot_format":
@@ -931,7 +1190,11 @@ def api_venezolanos_nombres():
     command = f"/nmv {query}"
     
     try:
-        result = run_telegram_command(command)
+        # Generar ID único para esta consulta
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        consulta_id = f"venezolanos_nombres_{timestamp}"
+        
+        result = run_telegram_command(command, consulta_id, "/venezolanos_nombres")
         if result.get("status", "").startswith("error"):
             status_code = 500
             if result.get("status") == "error_bot_format":
@@ -969,6 +1232,7 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "mode": "serverless",
+        "firebase": firebase_available,
         "timestamp": datetime.utcnow().isoformat(),
         "session_configured": bool(SESSION_STRING and SESSION_STRING.strip())
     })
@@ -989,13 +1253,85 @@ def debug_bots():
             "last_fail": bot_fail_tracker.get(LEDERDATA_BACKUP_BOT_ID, {}),
             "timeout": TIMEOUT_BACKUP
         },
-        "block_hours": BOT_BLOCK_HOURS
+        "block_hours": BOT_BLOCK_HOURS,
+        "firebase": {
+            "available": firebase_available,
+            "bucket": FIREBASE_STORAGE_BUCKET if firebase_available else None
+        }
     })
 
+# --- Nuevos endpoints para Firebase ---
+@app.route("/firebase/test", methods=["GET"])
+def test_firebase():
+    """Endpoint para probar la conexión a Firebase"""
+    if not firebase_available:
+        return jsonify({
+            "status": "error",
+            "message": "Firebase SDK no disponible. Instala: pip install google-cloud-storage"
+        }), 500
+    
+    try:
+        client = get_storage_client()
+        if not client:
+            return jsonify({
+                "status": "error",
+                "message": "No se pudo crear cliente de Firebase Storage"
+            }), 500
+        
+        # Intentar listar buckets
+        buckets = list(client.list_buckets())
+        
+        return jsonify({
+            "status": "ok",
+            "message": "Conexión a Firebase Storage exitosa",
+            "project": client.project,
+            "buckets_count": len(buckets),
+            "configured_bucket": FIREBASE_STORAGE_BUCKET
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Error conectando a Firebase Storage: {str(e)}"
+        }), 500
+
+@app.route("/firebase/files/<consulta_id>", methods=["GET"])
+def get_firebase_files(consulta_id):
+    """Obtener archivos de una consulta específica desde Firebase"""
+    if not firebase_available:
+        return jsonify({
+            "status": "error",
+            "message": "Firebase no disponible"
+        }), 500
+    
+    try:
+        urls = archivos_existentes_en_storage(consulta_id)
+        if urls:
+            return jsonify({
+                "status": "ok",
+                "consulta_id": consulta_id,
+                "files_count": len(urls),
+                "urls": urls
+            })
+        else:
+            return jsonify({
+                "status": "not_found",
+                "message": f"No se encontraron archivos para la consulta {consulta_id}"
+            }), 404
+            
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Error obteniendo archivos: {str(e)}"
+        }), 500
+
 if __name__ == "__main__":
-    print("🚀 Iniciando backend en modo SERVERLESS (on-demand)")
+    print("🚀 Iniciando backend en modo SERVERLESS (on-demand) con Firebase")
     print("📊 Modo optimizado para costos (<5 USD/mes)")
     print("🔗 Telethon se conecta solo cuando recibe consultas")
     print(f"⏰ Timeouts: Principal={TIMEOUT_PRIMARY}s, Respaldo={TIMEOUT_BACKUP}s")
     print(f"🔒 Bloqueo bot fallado: {BOT_BLOCK_HOURS} horas")
+    print(f"🔥 Firebase Storage: {'CONECTADO' if firebase_available else 'NO DISPONIBLE'}")
+    if firebase_available:
+        print(f"   Bucket: {FIREBASE_STORAGE_BUCKET}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
