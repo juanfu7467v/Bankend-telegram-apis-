@@ -75,16 +75,19 @@ def record_bot_failure(bot_id: str):
     print(f"🚨 Bot {bot_id} ha fallado y será BLOQUEADO por {BOT_BLOCK_HOURS} horas.")
     bot_fail_tracker[bot_id] = datetime.now()
 
-# --- Funciones de Firebase Storage ---
+# --- Funciones de Firebase Storage (MEJORADAS con logs detallados) ---
 def get_storage_client():
     """Obtiene el cliente de Firebase Storage"""
     if not firebase_available:
+        print("❌ ERROR: Firebase no disponible al intentar obtener cliente")
         return None
     try:
         client = storage.Client()
+        print("✅ Cliente de Firebase Storage creado exitosamente")
         return client
     except Exception as e:
-        print(f"❌ Error al conectar con Firebase Storage: {e}")
+        print(f"❌ ERROR CRÍTICO al conectar con Firebase Storage: {str(e)}")
+        traceback.print_exc()
         return None
 
 def archivos_existentes_en_storage(consulta_id: str, tipo_consulta: str = None):
@@ -92,14 +95,17 @@ def archivos_existentes_en_storage(consulta_id: str, tipo_consulta: str = None):
     Revisa si los archivos ya existen en Firebase Storage
     """
     if not firebase_available:
+        print("❌ Firebase no disponible para verificar archivos existentes")
         return None
     
     try:
         client = get_storage_client()
         if not client:
+            print("❌ No se pudo obtener cliente de Firebase Storage")
             return None
         
         bucket = client.bucket(FIREBASE_STORAGE_BUCKET)
+        print(f"✅ Bucket de Firebase obtenido: {FIREBASE_STORAGE_BUCKET}")
         
         # Construir el prefijo según tipo de consulta
         if tipo_consulta:
@@ -109,27 +115,50 @@ def archivos_existentes_en_storage(consulta_id: str, tipo_consulta: str = None):
             prefixes = [f"resultados/{tipo}/{consulta_id}/" for tipo in ["DNI_virtual", "SBS", "Denuncias", "general"]]
             all_blobs = []
             for prefix in prefixes:
-                blobs = list(bucket.list_blobs(prefix=prefix))
-                if blobs:
-                    all_blobs.extend(blobs)
+                try:
+                    blobs = list(bucket.list_blobs(prefix=prefix))
+                    if blobs:
+                        all_blobs.extend(blobs)
+                except Exception as e:
+                    print(f"⚠️ Error listando blobs con prefijo {prefix}: {e}")
             
             if all_blobs:
-                return [blob.public_url for blob in all_blobs]
+                urls = []
+                for blob in all_blobs:
+                    try:
+                        if not blob.public_url:
+                            blob.make_public()
+                        urls.append(blob.public_url)
+                    except Exception as e:
+                        print(f"⚠️ Error obteniendo URL pública para blob: {e}")
+                print(f"✅ Encontrados {len(urls)} archivos en Firebase Storage")
+                return urls
+            print(f"ℹ️ No se encontraron archivos en Storage para consulta {consulta_id}")
             return None
         
-        blobs = list(bucket.list_blobs(prefix=prefix))
-        if blobs:
-            urls = []
-            for blob in blobs:
-                # Asegurar que la URL sea pública
-                if not blob.public_url:
-                    blob.make_public()
-                urls.append(blob.public_url)
-            return urls
-        return None
+        try:
+            blobs = list(bucket.list_blobs(prefix=prefix))
+            if blobs:
+                urls = []
+                for blob in blobs:
+                    try:
+                        if not blob.public_url:
+                            blob.make_public()
+                        urls.append(blob.public_url)
+                    except Exception as e:
+                        print(f"⚠️ Error obteniendo URL pública para blob: {e}")
+                print(f"✅ Encontrados {len(urls)} archivos en Firebase Storage con prefijo {prefix}")
+                return urls
+            print(f"ℹ️ No se encontraron archivos en Storage con prefijo {prefix}")
+            return None
+            
+        except Exception as e:
+            print(f"❌ Error listando blobs con prefijo {prefix}: {e}")
+            return None
         
     except Exception as e:
-        print(f"⚠️ Error al verificar archivos en Storage: {e}")
+        print(f"❌ ERROR CRÍTICO al verificar archivos en Storage: {str(e)}")
+        traceback.print_exc()
         return None
 
 def subir_archivos_a_storage(files_data, consulta_id: str, tipo_consulta: str = None):
@@ -138,22 +167,29 @@ def subir_archivos_a_storage(files_data, consulta_id: str, tipo_consulta: str = 
     files_data: lista de tuplas (filename, file_content, content_type)
     """
     if not firebase_available:
+        print("❌ ERROR: Firebase no disponible al intentar subir.")
         return None
     
     try:
         client = get_storage_client()
         if not client:
+            print("❌ No se pudo crear cliente de Firebase Storage")
             return None
         
         bucket = client.bucket(FIREBASE_STORAGE_BUCKET)
-        urls = []
+        print(f"✅ Bucket de Firebase listo: {FIREBASE_STORAGE_BUCKET}")
         
         # Determinar tipo de consulta para organización
         if not tipo_consulta:
             tipo_consulta = determinar_tipo_consulta_por_comando(request.path)
         
+        urls = []
+        successful_uploads = 0
+        
         for idx, (filename, file_content, content_type) in enumerate(files_data):
             try:
+                print(f"📤 Procesando archivo {idx+1}/{len(files_data)} para subida a Firebase")
+                
                 # Obtener extensión del archivo
                 file_ext = os.path.splitext(filename)[1] if filename else '.jpg'
                 if not file_ext or file_ext == '.':
@@ -181,28 +217,35 @@ def subir_archivos_a_storage(files_data, consulta_id: str, tipo_consulta: str = 
                 # Configurar metadata
                 blob.content_type = content_type or mimetypes.guess_type(filename)[0] if filename else 'application/octet-stream'
                 
+                print(f"   Subiendo a: {storage_path} ({len(file_content)} bytes)")
+                
                 # Subir contenido
-                blob.upload_from_string(file_content)
+                blob.upload_from_string(file_content, content_type=blob.content_type)
                 
                 # Hacer público
                 blob.make_public()
                 
                 urls.append({
                     "url": blob.public_url,
-                    "filename": unique_filename,
-                    "type": content_type or "unknown"
+                    "type": "document",  # Siempre "document" para consistencia
+                    "filename": unique_filename
                 })
                 
+                successful_uploads += 1
                 print(f"✅ Archivo subido a Firebase: {storage_path}")
                 
             except Exception as e:
-                print(f"⚠️ Error subiendo archivo {idx}: {e}")
+                print(f"❌ ERROR subiendo archivo {idx}: {str(e)}")
+                traceback.print_exc()
                 continue
         
-        return urls
+        print(f"📊 Resumen: {successful_uploads}/{len(files_data)} archivos subidos exitosamente a Firebase")
+        return urls if successful_uploads > 0 else None
         
     except Exception as e:
-        print(f"❌ Error general subiendo archivos a Storage: {e}")
+        # ESTO ES CLAVE: Ver el error real en los logs de Railway/Fly.io
+        print(f"❌ FALLO CRÍTICO FIREBASE: {str(e)}")
+        traceback.print_exc()
         return None
 
 def determinar_tipo_consulta_por_comando(comando_path: str):
@@ -215,6 +258,10 @@ def determinar_tipo_consulta_por_comando(comando_path: str):
         'dnif': 'DNI_virtual',
         'dnidb': 'DNI_virtual',
         'dnifdb': 'DNI_virtual',
+        'dnivaz': 'DNI_virtual',
+        'dnivam': 'DNI_virtual',
+        'dnivel': 'DNI_virtual',
+        'dniveln': 'DNI_virtual',
         'sbs': 'SBS',
         'denuncia': 'Denuncias',
         'dence': 'Denuncias',
@@ -237,17 +284,18 @@ def determinar_tipo_consulta_por_comando(comando_path: str):
 app = Flask(__name__)
 CORS(app)
 
-# --- Lógica de Limpieza y Extracción de Datos ---
+# --- Lógica de Limpieza y Extracción de Datos (MEJORADA) ---
 def clean_and_extract(raw_text: str):
     if not raw_text:
         return {"text": "", "fields": {}}
 
     text = raw_text
     
-    # 1. Reemplazar la marca LEDER_BOT por CONSULTA PE
-    text = re.sub(r"^\[\#LEDER\_BOT\]", "[CONSULTA PE]", text, flags=re.IGNORECASE | re.DOTALL)
+    # 1. Eliminar completamente cualquier mención de LEDER_BOT
+    text = re.sub(r"\[#?LEDER_BOT\]", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\[CONSULTA PE\]", "", text, flags=re.IGNORECASE)
     
-    # 2. Eliminar cabecera
+    # 2. Eliminar cabecera completa
     header_pattern = r"^\[.*?\]\s*→\s*.*?\[.*?\](\r?\n){1,2}"
     text = re.sub(header_pattern, "", text, flags=re.IGNORECASE | re.DOTALL)
     
@@ -255,33 +303,60 @@ def clean_and_extract(raw_text: str):
     footer_pattern = r"((\r?\n){1,2}\[|Página\s*\d+\/\d+.*|(\r?\n){1,2}Por favor, usa el formato correcto.*|↞ Anterior|Siguiente ↠.*|Credits\s*:.+|Wanted for\s*:.+|\s*@lederdata.*|(\r?\n){1,2}\s*Marca\s*@lederdata.*|(\r?\n){1,2}\s*Créditos\s*:\s*\d+)"
     text = re.sub(footer_pattern, "", text, flags=re.IGNORECASE | re.DOTALL)
     
-    # 4. Limpiar separador
+    # 4. Limpiar separadores y espacios extra
     text = re.sub(r"\-{3,}", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"\s+", " ", text)  # Normalizar espacios
     text = text.strip()
 
-    # 5. Extraer datos clave
+    # 5. Extracción dinámica de campos estándar
     fields = {}
-    dni_match = re.search(r"DNI\s*:\s*(\d{8})", text, re.IGNORECASE)
-    if dni_match: fields["dni"] = dni_match.group(1)
     
-    ruc_match = re.search(r"RUC\s*:\s*(\d{11})", text, re.IGNORECASE)
-    if ruc_match: fields["ruc"] = ruc_match.group(1)
-
+    # Patrones de extracción mejorados
+    patterns = {
+        "dni": r"DNI\s*:\s*(\d{8})",
+        "ruc": r"RUC\s*:\s*(\d{11})",
+        "apellido_paterno": r"APELLIDO\s+PATERNO\s*:\s*(.*?)(?:\n|$)",
+        "apellido_materno": r"APELLIDO\s+MATERNO\s*:\s*(.*?)(?:\n|$)", 
+        "nombres": r"NOMBRES\s*:\s*(.*?)(?:\n|$)",
+        "estado": r"ESTADO\s*:\s*(.*?)(?:\n|$)",
+        "fecha_nacimiento": r"(?:FECHA\s+DE\s+NACIMIENTO|F\.?NAC\.?)\s*:\s*(.*?)(?:\n|$)",
+        "genero": r"(?:GÉNERO|SEXO)\s*:\s*(.*?)(?:\n|$)",
+        "direccion": r"(?:DIRECCIÓN|DOMICILIO)\s*:\s*(.*?)(?:\n|$)",
+        "ubigeo": r"UBIGEO\s*:\s*(.*?)(?:\n|$)",
+        "departamento": r"DEPARTAMENTO\s*:\s*(.*?)(?:\n|$)",
+        "provincia": r"PROVINCIA\s*:\s*(.*?)(?:\n|$)",
+        "distrito": r"DISTRITO\s*:\s*(.*?)(?:\n|$)",
+    }
+    
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+        if match:
+            fields[key] = match.group(1).strip()
+            # Limpiar el campo del texto principal
+            text = re.sub(pattern, "", text, flags=re.IGNORECASE | re.DOTALL)
+    
+    # Extraer tipo de foto si existe
     photo_type_match = re.search(r"Foto\s*:\s*(rostro|huella|firma|adverso|reverso).*", text, re.IGNORECASE)
-    if photo_type_match: fields["photo_type"] = photo_type_match.group(1).lower()
+    if photo_type_match: 
+        fields["photo_type"] = photo_type_match.group(1).lower()
     
     # 6. Manejo de mensajes de no encontrado
     not_found_pattern = r"\[⚠️\]\s*(no se encontro información|no se han encontrado resultados|no se encontró una|no hay resultados|no tenemos datos|no se encontraron registros)"
     if re.search(not_found_pattern, text, re.IGNORECASE | re.DOTALL):
          fields["not_found"] = True
-
+    
+    # Limpiar texto final
+    text = re.sub(r"\n\s*\n", "\n", text)  # Eliminar líneas vacías múltiples
+    text = text.strip()
+    
     return {"text": text, "fields": fields}
 
-# --- Función Principal para Conexión On-Demand (MEJORADA para capturar TODOS los mensajes) ---
+# --- Función Principal para Conexión On-Demand (MEJORADA para JSON limpio) ---
 async def send_telegram_command(command: str, consulta_id: str = None, endpoint_path: str = None):
     """
     Función on-demand con soporte para múltiples archivos y Firebase Storage
     MEJORADA: Captura TODOS los mensajes y archivos del bot
+    MEJORADA: Devuelve JSON limpio sin marcas LEDERDATA
     """
     client = None
     try:
@@ -318,15 +393,20 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
         urls_existentes = archivos_existentes_en_storage(consulta_id, tipo_consulta)
         if urls_existentes and firebase_available:
             print(f"✅ Archivos encontrados en Firebase Storage para consulta {consulta_id}")
-            # Retornar estructura similar a la que espera el bot
-            return {
-                "status": "ok",
-                "message": "Consulta recuperada de cache",
-                "fields": {"dni": dni} if dni else {},
-                "urls": {f"file_{i}": url for i, url in enumerate(urls_existentes)},
+            # Extraer campos básicos del comando
+            response_data = {
+                "dni": dni,
+                "total_files": len(urls_existentes),
+                "total_messages": 1,
+                "urls": [{"type": "document", "url": url} for url in urls_existentes],
                 "from_cache": True,
                 "consulta_id": consulta_id
             }
+            
+            # Limpiar campos None
+            response_data = {k: v for k, v in response_data.items() if v is not None}
+            
+            return response_data
         
         # 8. Determinar orden de bots según bloqueos
         bots_order = []
@@ -400,7 +480,6 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                         for i, media in enumerate(media_list):
                             try:
                                 file_ext = '.file'
-                                is_photo = False
                                 content_type = None
                                 
                                 if hasattr(media, 'document') and hasattr(media.document, 'attributes'):
@@ -417,7 +496,6 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                                         content_type = 'application/octet-stream'
                                 elif isinstance(media, MessageMediaPhoto) or (hasattr(media, 'photo') and media.photo):
                                     file_ext = '.jpg'
-                                    is_photo = True
                                     content_type = 'image/jpeg'
                                     
                                 dni_part = f"_{cleaned['fields'].get('dni')}" if cleaned["fields"].get("dni") else ""
@@ -435,11 +513,10 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                                     # Guardar para subir a Firebase
                                     all_files_data.append((unique_filename, file_content, content_type))
                                 
-                                # URL local
+                                # URL local temporal
                                 url_obj = {
                                     "url": f"{PUBLIC_URL}/files/{os.path.basename(saved_path)}", 
-                                    "type": cleaned['fields'].get('photo_type', 'image' if is_photo else 'document'),
-                                    "text_context": raw_text.split('\n')[0].strip()
+                                    "type": "document",  # Siempre "document" para consistencia
                                 }
                                 msg_urls.append(url_obj)
                                 
@@ -545,9 +622,8 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                     
                     if format_error_detected:
                         return {
-                            "status": "error_bot_format", 
-                            "message": "Formato de consulta incorrecto. Verifica los parámetros enviados.",
-                            "bot_used": current_bot_id
+                            "status": "error",
+                            "message": "Formato de consulta incorrecto. Verifica los parámetros enviados."
                         }
                     
                     # Verificar si es "no encontrado" en cualquier mensaje
@@ -559,87 +635,71 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                     
                     if not_found_detected:
                         return {
-                            "status": "error_not_found", 
-                            "message": "No se encontraron resultados para dicha consulta. Intenta con otro dato.",
-                            "bot_used": current_bot_id
+                            "status": "error",
+                            "message": "No se encontraron resultados para dicha consulta. Intenta con otro dato."
                         }
                     
-                    # --- CONSOLIDAR TODO EL CONTENIDO (MEJORADO) ---
-                    final_text = []
-                    final_urls = []  # Cambiar a lista para no perder nada
-                    all_fields = {}
+                    # --- CONSOLIDAR CAMPOS DE TODOS LOS MENSAJES (MEJORADO) ---
+                    final_fields = {}
+                    urls_temporales = []
                     
                     for msg in all_received_messages:
-                        # Consolidar texto
-                        if msg.get("message"):
-                            final_text.append(msg["message"])
-                        
-                        # Consolidar fields (sin sobrescribir)
+                        # Unificar fields de todos los mensajes (sin sobrescribir)
                         if msg.get("fields"):
                             for key, value in msg["fields"].items():
-                                if key not in all_fields:
-                                    all_fields[key] = value
+                                if key not in final_fields:
+                                    final_fields[key] = value
                         
-                        # Extraer TODAS las URLs de este mensaje
+                        # Extraer URLs temporales
                         if isinstance(msg.get("urls"), list):
                             for url_obj in msg["urls"]:
-                                # Agregar URL a la lista (no sobrescribir)
-                                final_urls.append({
-                                    "url": url_obj.get("url"),
-                                    "type": url_obj.get("type", "unknown"),
-                                    "text_context": url_obj.get("text_context", "")
+                                # Solo tipo y URL, sin text_context
+                                urls_temporales.append({
+                                    "type": url_obj.get("type", "document"),
+                                    "url": url_obj.get("url")
                                 })
                     
-                    # Crear JSON de respuesta final
-                    final_json = {
-                        "status": "ok",
-                        "message": "\n\n---\n\n".join(final_text) if final_text else "Consulta procesada",
-                        "fields": all_fields,
-                        "urls": final_urls,  # Ahora es una lista completa de todos los archivos
-                        "consulta_id": consulta_id,
-                        "bot_used": current_bot_id,
-                        "total_messages": len(all_received_messages),
-                        "total_files": len(final_urls)
-                    }
+                    # 13. SUBIR ARCHIVOS A FIREBASE STORAGE (OBLIGATORIO)
+                    urls_finales = []
+                    firebase_upload_success = False
                     
-                    # Mover DNI/RUC al nivel superior si existen
-                    dni_val = final_json["fields"].get("dni")
-                    ruc_val = final_json["fields"].get("ruc")
-                    
-                    if dni_val:
-                        final_json["dni"] = dni_val
-                        final_json["fields"].pop("dni", None)
-                    if ruc_val:
-                        final_json["ruc"] = ruc_val
-                        final_json["fields"].pop("ruc", None)
-                    
-                    # 13. SUBIR ARCHIVOS A FIREBASE STORAGE
                     if all_files_data and firebase_available:
-                        try:
-                            firebase_urls = subir_archivos_a_storage(all_files_data, consulta_id, tipo_consulta)
-                            if firebase_urls:
-                                # Agregar URLs de Firebase a la respuesta
-                                firebase_url_list = []
-                                for url_info in firebase_urls:
-                                    firebase_url_list.append({
-                                        "url": url_info["url"],
-                                        "type": "firebase_storage",
-                                        "filename": url_info["filename"]
-                                    })
-                                
-                                # Combinar URLs locales con Firebase
-                                final_json["urls"].extend(firebase_url_list)
-                                final_json["firebase_uploaded"] = True
-                                final_json["firebase_files"] = len(firebase_urls)
-                                print(f"✅ {len(firebase_urls)} archivos subidos a Firebase Storage")
-                        except Exception as e:
-                            print(f"⚠️ Error subiendo a Firebase (no crítico): {e}")
-                            final_json["firebase_uploaded"] = False
+                        print(f"📤 Intentando subir {len(all_files_data)} archivos a Firebase Storage...")
+                        firebase_res = subir_archivos_a_storage(all_files_data, consulta_id, tipo_consulta)
+                        if firebase_res:
+                            urls_finales = firebase_res  # Usar URLs permanentes de Firebase
+                            firebase_upload_success = True
+                            print(f"✅ {len(firebase_res)} archivos subidos exitosamente a Firebase")
+                        else:
+                            # Si falla Firebase, usar las locales pero marcar advertencia en logs
+                            print("⚠️ Usando URLs locales temporales porque Firebase falló")
+                            urls_finales = urls_temporales
+                    elif all_files_data and not firebase_available:
+                        print("⚠️ Firebase no disponible, usando URLs locales")
+                        urls_finales = urls_temporales
+                    
+                    # 14. CONSTRUIR RESPUESTA LIMPIA
+                    response_data = {}
+                    
+                    # Agregar campos extraídos al nivel raíz
+                    for key, value in final_fields.items():
+                        if value:  # Solo agregar si tiene valor
+                            response_data[key] = value
+                    
+                    # Agregar metadatos
+                    response_data["total_files"] = len(urls_finales)
+                    response_data["total_messages"] = len(all_received_messages)
+                    response_data["urls"] = urls_finales
+                    
+                    if firebase_upload_success:
+                        response_data["storage"] = "firebase"
+                    else:
+                        response_data["storage"] = "local"
                     
                     # LIMPIAR handler de eventos para evitar fugas
                     client.remove_event_handler(temp_handler)
                     
-                    return final_json
+                    return response_data
                 else:
                     # Caso raro: sin mensajes recibidos
                     raise Exception("No se recibieron mensajes del bot")
@@ -676,7 +736,7 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
         }
         
     finally:
-        # 14. Limpieza final
+        # 15. Limpieza final
         if client:
             try:
                 await client.disconnect()
@@ -801,7 +861,7 @@ def root():
         "mode": "serverless",
         "firebase_available": firebase_available,
         "cost_optimized": True,
-        "version": "3.0 - Captura múltiple mejorada"
+        "version": "4.0 - JSON limpio y Firebase mejorado"
     })
 
 @app.route("/status")
@@ -857,16 +917,16 @@ def handle_api_endpoint(endpoint_path):
         # Ejecutar comando
         result = run_telegram_command(command, consulta_id, endpoint_path)
         
-        if result.get("status", "").startswith("error"):
+        # Si la respuesta tiene status="error", mantener formato antiguo
+        if result.get("status") == "error":
             status_code = 500
-            if result.get("status") == "error_bot_format":
+            if "Formato de consulta incorrecto" in result.get("message", ""):
                 status_code = 400
-            elif result.get("status") == "error_not_found":
+            elif "No se encontraron resultados" in result.get("message", ""):
                 status_code = 404
-            elif "timeout" in result.get("message", "").lower():
-                status_code = 504
             return jsonify(result), status_code
-            
+        
+        # Si no tiene status, es el nuevo formato limpio
         return jsonify(result)
         
     except FutureTimeoutError:
@@ -1167,14 +1227,14 @@ def api_dni_nombres():
         consulta_id = f"dni_nombres_{timestamp}"
         
         result = run_telegram_command(command, consulta_id, "/dni_nombres")
-        if result.get("status", "").startswith("error"):
+        
+        # Manejar errores
+        if result.get("status") == "error":
             status_code = 500
-            if result.get("status") == "error_bot_format":
+            if "Formato de consulta incorrecto" in result.get("message", ""):
                 status_code = 400
-            elif result.get("status") == "error_not_found":
+            elif "No se encontraron resultados" in result.get("message", ""):
                 status_code = 404
-            elif "timeout" in result.get("message", "").lower():
-                status_code = 504
             return jsonify(result), status_code
             
         return jsonify(result)
@@ -1208,14 +1268,14 @@ def api_venezolanos_nombres():
         consulta_id = f"venezolanos_nombres_{timestamp}"
         
         result = run_telegram_command(command, consulta_id, "/venezolanos_nombres")
-        if result.get("status", "").startswith("error"):
+        
+        # Manejar errores
+        if result.get("status") == "error":
             status_code = 500
-            if result.get("status") == "error_bot_format":
+            if "Formato de consulta incorrecto" in result.get("message", ""):
                 status_code = 400
-            elif result.get("status") == "error_not_found":
+            elif "No se encontraron resultados" in result.get("message", ""):
                 status_code = 404
-            elif "timeout" in result.get("message", "").lower():
-                status_code = 504
             return jsonify(result), status_code
             
         return jsonify(result)
@@ -1251,7 +1311,9 @@ def health_check():
         "features": {
             "multiple_messages": True,
             "idle_timeout": True,
-            "firebase_storage": firebase_available
+            "firebase_storage": firebase_available,
+            "clean_json": True,
+            "field_extraction": True
         }
     })
 
@@ -1274,7 +1336,8 @@ def debug_bots():
         "block_hours": BOT_BLOCK_HOURS,
         "firebase": {
             "available": firebase_available,
-            "bucket": FIREBASE_STORAGE_BUCKET if firebase_available else None
+            "bucket": FIREBASE_STORAGE_BUCKET if firebase_available else None,
+            "project": FIREBASE_PROJECT_ID if firebase_available else None
         }
     })
 
@@ -1299,15 +1362,23 @@ def test_firebase():
         # Intentar listar buckets
         buckets = list(client.list_buckets())
         
+        # Probar bucket específico
+        bucket = client.bucket(FIREBASE_STORAGE_BUCKET)
+        bucket_exists = bucket.exists()
+        
         return jsonify({
             "status": "ok",
             "message": "Conexión a Firebase Storage exitosa",
             "project": client.project,
             "buckets_count": len(buckets),
-            "configured_bucket": FIREBASE_STORAGE_BUCKET
+            "configured_bucket": FIREBASE_STORAGE_BUCKET,
+            "bucket_exists": bucket_exists,
+            "client_email": FIREBASE_CLIENT_EMAIL
         })
         
     except Exception as e:
+        print(f"❌ Error detallado Firebase: {str(e)}")
+        traceback.print_exc()
         return jsonify({
             "status": "error",
             "message": f"Error conectando a Firebase Storage: {str(e)}"
@@ -1354,9 +1425,10 @@ if __name__ == "__main__":
         print(f"   Bucket: {FIREBASE_STORAGE_BUCKET}")
     print("✨ MEJORAS IMPLEMENTADAS:")
     print("   ✓ Captura TODOS los mensajes del bot (2, 5, 20+ mensajes)")
-    print("   ✓ Lógica de espera con idle timeout (4 segundos de silencio)")
-    print("   ✓ URLs como lista (no se sobrescriben archivos del mismo tipo)")
-    print("   ✓ Handler más permisivo (no se detiene inmediatamente con errores)")
-    print("   ✓ Consolidación completa de texto y archivos")
+    print("   ✓ JSON LIMPIO sin marcas LEDERDATA")
+    print("   ✓ Campos extraídos al nivel raíz (dni, nombres, apellidos, etc.)")
+    print("   ✓ Persistencia obligatoria en Firebase Storage")
+    print("   ✓ Logs detallados de errores de Firebase")
+    print("   ✓ URLs limpias sin text_context")
     print("   ✓ Todos los comandos preservados")
     app.run(host="0.0.0.0", port=PORT, debug=False)
