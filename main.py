@@ -22,24 +22,6 @@ PUBLIC_URL = os.getenv("PUBLIC_URL", "https://consulta-pe-bot.up.railway.app").r
 SESSION_STRING = os.getenv("SESSION_STRING", None)
 PORT = int(os.getenv("PORT", 8080))
 
-# --- Configuración de Firebase (mantenida pero no se usará para validación) ---
-FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "consulta-pe-abf99")
-FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL", "firebase-adminsdk-fbsvc@consulta-pe-abf99.iam.gserviceaccount.com")
-FIREBASE_PRIVATE_KEY = os.getenv("FIREBASE_PRIVATE_KEY", "").replace("\\n", "\n")
-FIREBASE_STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET", "consulta-pe-abf99.appspot.com")
-
-# Importación de Firebase (solo para subida opcional, no para validación)
-try:
-    from google.cloud import storage
-    from google.oauth2 import service_account
-    firebase_available = True
-    print("✅ Firebase SDK disponible (solo para subida opcional)")
-except ImportError:
-    print("⚠️ Firebase SDK no disponible. Las subidas a Storage estarán deshabilitadas.")
-    firebase_available = False
-    storage = None
-    service_account = None
-
 # --- Configuración Interna ---
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -76,161 +58,6 @@ def record_bot_failure(bot_id: str):
     """Registra la hora actual como la última hora de fallo del bot."""
     print(f"🚨 Bot {bot_id} ha fallado y será BLOQUEADO por {BOT_BLOCK_HOURS} horas.")
     bot_fail_tracker[bot_id] = datetime.now()
-
-# --- Funciones de Firebase Storage (SOLO PARA SUBIDA, NO PARA VALIDACIÓN) ---
-def get_storage_client():
-    """Obtiene el cliente de Firebase Storage - SOLO PARA SUBIDA"""
-    if not firebase_available or not service_account:
-        print("❌ Firebase no disponible para subida de archivos")
-        return None
-    
-    try:
-        # Verificar credenciales
-        if not FIREBASE_PRIVATE_KEY or not FIREBASE_CLIENT_EMAIL:
-            print("❌ Faltan credenciales de Firebase para subida")
-            return None
-        
-        # Crear diccionario de credenciales
-        service_account_info = {
-            "type": "service_account",
-            "project_id": FIREBASE_PROJECT_ID,
-            "private_key": FIREBASE_PRIVATE_KEY,
-            "client_email": FIREBASE_CLIENT_EMAIL,
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-            "client_x509_cert_url": f"https://www.googleapis.com/robot/v1/metadata/x509/{FIREBASE_CLIENT_EMAIL.replace('@', '%40')}"
-        }
-        
-        # Crear credenciales explícitas
-        credentials = service_account.Credentials.from_service_account_info(service_account_info)
-        
-        # Crear cliente con credenciales explícitas
-        client = storage.Client(
-            project=FIREBASE_PROJECT_ID,
-            credentials=credentials
-        )
-        
-        print("✅ Cliente de Firebase Storage creado (solo para subida)")
-        return client
-        
-    except Exception as e:
-        print(f"❌ ERROR al conectar con Firebase Storage para subida: {str(e)}")
-        traceback.print_exc()
-        return None
-
-def subir_archivos_a_storage(files_data, consulta_id: str, tipo_consulta: str = None):
-    """
-    Sube todos los archivos recibidos a Firebase Storage (OPCIONAL)
-    files_data: lista de tuplas (filename, file_content, content_type)
-    """
-    if not firebase_available:
-        print("❌ Firebase no disponible para subida de archivos")
-        return None
-    
-    try:
-        client = get_storage_client()
-        if not client:
-            print("❌ No se pudo crear cliente de Firebase Storage para subida")
-            return None
-        
-        bucket = client.bucket(FIREBASE_STORAGE_BUCKET)
-        print(f"✅ Bucket de Firebase listo para subida: {FIREBASE_STORAGE_BUCKET}")
-        
-        if not tipo_consulta:
-            tipo_consulta = determinar_tipo_consulta_por_comando(request.path)
-        
-        urls = []
-        successful_uploads = 0
-        
-        for idx, (filename, file_content, content_type) in enumerate(files_data):
-            try:
-                print(f"📤 Procesando archivo {idx+1}/{len(files_data)} para subida a Firebase")
-                
-                # Obtener extensión del archivo
-                file_ext = os.path.splitext(filename)[1] if filename else '.jpg'
-                if not file_ext or file_ext == '.':
-                    if content_type:
-                        if 'pdf' in content_type.lower():
-                            file_ext = '.pdf'
-                        elif 'png' in content_type.lower():
-                            file_ext = '.png'
-                        elif 'jpeg' in content_type.lower() or 'jpg' in content_type.lower():
-                            file_ext = '.jpg'
-                        else:
-                            file_ext = '.bin'
-                
-                # Nombre único por archivo
-                safe_filename = re.sub(r'[^\w\-\.]', '_', filename or f"file_{idx}")
-                unique_filename = f"{consulta_id}_{idx}_{safe_filename}"
-                
-                # Ruta organizada en Storage
-                storage_path = f"resultados/{tipo_consulta}/{consulta_id}/{unique_filename}"
-                
-                # Subir archivo
-                blob = bucket.blob(storage_path)
-                blob.content_type = content_type or mimetypes.guess_type(filename)[0] if filename else 'application/octet-stream'
-                
-                print(f"   Subiendo a: {storage_path} ({len(file_content)} bytes)")
-                blob.upload_from_string(file_content, content_type=blob.content_type)
-                
-                # Hacer público
-                blob.make_public()
-                
-                urls.append({
-                    "url": blob.public_url,
-                    "type": "document",
-                    "filename": unique_filename
-                })
-                
-                successful_uploads += 1
-                print(f"✅ Archivo subido a Firebase: {storage_path}")
-                
-            except Exception as e:
-                print(f"❌ ERROR subiendo archivo {idx}: {str(e)}")
-                continue
-        
-        print(f"📊 Resumen subida: {successful_uploads}/{len(files_data)} archivos subidos a Firebase")
-        return urls if successful_uploads > 0 else None
-        
-    except Exception as e:
-        print(f"❌ FALLO en subida a Firebase: {str(e)}")
-        return None
-
-def determinar_tipo_consulta_por_comando(comando_path: str):
-    """Determina el tipo de consulta basado en el endpoint"""
-    comando = comando_path.lstrip('/').split('/')[0]
-    
-    # Mapeo de comandos a tipos de consulta
-    tipo_por_comando = {
-        'dni': 'DNI_virtual',
-        'dnif': 'DNI_virtual',
-        'dnidb': 'DNI_virtual',
-        'dnifdb': 'DNI_virtual',
-        'dnivaz': 'DNI_virtual',
-        'dnivam': 'DNI_virtual',
-        'dnivel': 'DNI_virtual',
-        'dniveln': 'DNI_virtual',
-        'sbs': 'SBS',
-        'denuncia': 'Denuncias',
-        'dence': 'Denuncias',
-        'denpas': 'Denuncias',
-        'denci': 'Denuncias',
-        'denp': 'Denuncias',
-        'denar': 'Denuncias',
-        'dencl': 'Denuncias',
-        'migrapdf': 'Migraciones',
-        'sunat': 'SUNAT',
-        'sun': 'SUNAT',
-        'antpen': 'Antecedentes',
-        'antpol': 'Antecedentes',
-        'antjud': 'Antecedentes'
-    }
-    
-    return tipo_por_comando.get(comando, 'general')
-
-# --- Aplicación Flask ---
-app = Flask(__name__)
-CORS(app)
 
 # --- Lógica de Limpieza y Extracción de Datos (MEJORADA) ---
 def clean_and_extract(raw_text: str):
@@ -299,11 +126,14 @@ def clean_and_extract(raw_text: str):
     
     return {"text": text, "fields": fields}
 
-# --- Función Principal para Conexión On-Demand (MODIFICADA: SIN VALIDACIÓN DE STORAGE) ---
+# --- Función Principal para Conexión On-Demand (MEJORADA para JSON limpio) ---
 async def send_telegram_command(command: str, consulta_id: str = None, endpoint_path: str = None):
     """
-    Función on-demand SIN validación de Storage
-    Cada consulta se ejecuta siempre en tiempo real
+    Función on-demand con soporte para múltiples archivos
+    MEJORADA: Captura TODOS los mensajes y archivos del bot
+    MEJORADA: Devuelve JSON limpio sin marcas LEDERDATA
+    CORREGIDA: Evita desconexión prematura
+    MODIFICADA: Se eliminó la lógica de Storage PE
     """
     client = None
     handler_removed = False
@@ -330,15 +160,13 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
         dni_match = re.search(r"/\w+\s+(\d{8,11})", command)
         dni = dni_match.group(1) if dni_match else None
         
-        # 5. Determinar tipo de consulta (solo para organización de archivos)
-        tipo_consulta = determinar_tipo_consulta_por_comando(endpoint_path) if endpoint_path else "general"
-        
-        # 6. Generar consulta_id si no se proporciona
+        # 5. Generar consulta_id si no se proporciona
         if not consulta_id:
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            tipo_consulta = determinar_tipo_consulta_por_comando(endpoint_path) if endpoint_path else "general"
             consulta_id = f"{tipo_consulta}_{dni or 'unknown'}_{timestamp}" if dni else f"{tipo_consulta}_{timestamp}"
         
-        # 7. Determinar orden de bots según bloqueos
+        # 6. Determinar orden de bots según bloqueos
         bots_order = []
         
         if not is_bot_blocked(LEDERDATA_BOT_ID):
@@ -352,15 +180,15 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
         
         print(f"🔍 Orden de intentos: {bots_order}")
         
-        # 8. Variables para capturar respuestas
+        # 7. Variables para capturar respuestas
         all_received_messages = []  # Para múltiples mensajes del MISMO bot
-        all_files_data = []  # Para almacenar archivos
+        all_files_data = []  # Para almacenar archivos localmente
         stop_collecting = asyncio.Event()
         
         # Variable para trackear última actividad
         last_message_time = [time.time()]  # Usamos lista para poder modificar desde el handler
         
-        # 9. Handler temporal para capturar respuestas
+        # 8. Handler temporal para capturar respuestas (MEJORADO)
         @client.on(events.NewMessage(incoming=True))
         async def temp_handler(event):
             # Si ya tenemos respuesta completa, ignorar nuevos mensajes
@@ -403,22 +231,23 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                     "fields": cleaned["fields"],
                     "urls": [],
                     "bot_id": current_bot_entity.id if current_bot_entity else None,
-                    "event_message": event.message  # Guardar el objeto completo para descargas
+                    "event_message": event.message  # Guardar el objeto completo para descargas posteriores
                 }
                 
                 all_received_messages.append(msg_obj)
                 print(f"📥 Mensaje recibido de bot: {len(msg_obj['message'])} chars")
                 
                 # Verificar si es error de formato, pero NO detener inmediatamente
+                # El bot podría seguir enviando más mensajes
                 if ("Por favor, usa el formato correcto" in msg_obj["message"]):
                     print("⚠️ Error de formato detectado, pero continuamos escuchando por si hay más")
                 
             except Exception as e:
                 print(f"Error en handler temporal: {e}")
         
-        # 10. Intentar SECUENCIALMENTE con cada bot (SIEMPRE en tiempo real)
+        # 9. Intentar SECUENCIALMENTE con cada bot
         for attempt, current_bot_id in enumerate(bots_order, 1):
-            print(f"\n🎯 Intento {attempt}: Enviando a {current_bot_id} (SIEMPRE EN TIEMPO REAL)")
+            print(f"\n🎯 Intento {attempt}: Enviando a {current_bot_id}")
             print(f"   Comando: {command}")
             
             # Resetear para este intento
@@ -432,7 +261,7 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                 timeout = TIMEOUT_PRIMARY if current_bot_id == LEDERDATA_BOT_ID else TIMEOUT_BACKUP
                 print(f"   Timeout configurado: {timeout}s")
                 
-                # Enviar comando (SIEMPRE en tiempo real)
+                # Enviar comando
                 await client.send_message(current_bot_id, command)
                 
                 # Timer para múltiples mensajes
@@ -476,8 +305,8 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                         # No hay más bots, lanzar error
                         raise Exception(f"Ningún bot respondió. Último timeout: {timeout}s")
                 
-                # 11. SI LLEGAMOS AQUÍ, EL BOT RESPONDIÓ EN TIEMPO REAL
-                print(f"✅ {current_bot_id} respondió en tiempo real con {len(all_received_messages)} mensajes")
+                # 10. SI LLEGAMOS AQUÍ, EL BOT RESPONDIÓ
+                print(f"✅ {current_bot_id} respondió con {len(all_received_messages)} mensajes")
                 
                 # Marcar para detener cualquier espera futura
                 stop_collecting.set()
@@ -569,12 +398,12 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                                             file=os.path.join(DOWNLOAD_DIR, unique_filename)
                                         )
                                         
-                                        # Leer contenido
+                                        # Leer contenido para archivos locales
                                         if saved_path and os.path.exists(saved_path):
                                             with open(saved_path, 'rb') as f:
                                                 file_content = f.read()
                                             
-                                            # Guardar para posible subida a Firebase
+                                            # Guardar para posible uso futuro
                                             all_files_data.append((unique_filename, file_content, content_type))
                                             
                                             # URL local temporal
@@ -602,7 +431,7 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                         client.remove_event_handler(temp_handler)
                         handler_removed = True
                     
-                    # --- CONSOLIDAR CAMPOS DE TODOS LOS MENSAJES ---
+                    # --- CONSOLIDAR CAMPOS DE TODOS LOS MENSAJES (MEJORADO) ---
                     final_fields = {}
                     urls_temporales = []
                     
@@ -616,50 +445,31 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                         # Extraer URLs temporales
                         if isinstance(msg.get("urls"), list):
                             for url_obj in msg["urls"]:
+                                # Solo tipo y URL, sin text_context
                                 urls_temporales.append({
                                     "type": url_obj.get("type", "document"),
                                     "url": url_obj.get("url")
                                 })
                     
-                    # 12. SUBIR ARCHIVOS A FIREBASE STORAGE (OPCIONAL, NO OBLIGATORIO)
-                    urls_finales = []
-                    firebase_upload_success = False
-                    
-                    if all_files_data and firebase_available:
-                        print(f"📤 Intentando subir {len(all_files_data)} archivos a Firebase Storage (opcional)...")
-                        firebase_res = subir_archivos_a_storage(all_files_data, consulta_id, tipo_consulta)
-                        if firebase_res:
-                            urls_finales = firebase_res  # Usar URLs permanentes de Firebase
-                            firebase_upload_success = True
-                            print(f"✅ {len(firebase_res)} archivos subidos exitosamente a Firebase")
-                        else:
-                            print("⚠️ Falló subida a Firebase, usando URLs locales")
-                            urls_finales = urls_temporales
-                    else:
-                        urls_finales = urls_temporales
-                    
-                    # 13. CONSTRUIR RESPUESTA LIMPIA
+                    # 11. CONSTRUIR RESPUESTA LIMPIA (SIN STORAGE PE)
                     response_data = {}
                     
                     # Agregar campos extraídos al nivel raíz
                     for key, value in final_fields.items():
-                        if value:
+                        if value:  # Solo agregar si tiene valor
                             response_data[key] = value
                     
                     # Agregar metadatos
-                    response_data["total_files"] = len(urls_finales)
+                    response_data["total_files"] = len(urls_temporales)
                     response_data["total_messages"] = len(all_received_messages)
-                    response_data["urls"] = urls_finales
-                    response_data["real_time"] = True  # Indicar que fue en tiempo real
                     
-                    if firebase_upload_success:
-                        response_data["storage"] = "firebase"
-                    else:
-                        response_data["storage"] = "local"
+                    if urls_temporales:
+                        response_data["urls"] = urls_temporales
                     
                     return response_data
                 else:
                     # Caso raro: sin mensajes recibidos
+                    # Remover handler antes de desconectar
                     if client and not handler_removed:
                         client.remove_event_handler(temp_handler)
                         handler_removed = True
@@ -703,11 +513,11 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
     except Exception as e:
         return {
             "status": "error",
-            "message": f"Error al procesar comando en tiempo real: {str(e)}"
+            "message": f"Error al procesar comando: {str(e)}"
         }
         
     finally:
-        # 14. Limpieza final
+        # 12. Limpieza final - ¡AHORA SÍ podemos desconectar!
         if client:
             try:
                 # Asegurarnos de que el handler ya fue removido
@@ -829,18 +639,52 @@ def get_command_and_param(path, request_args):
 
     return f"/{command_name} {param}".strip(), None
 
+def determinar_tipo_consulta_por_comando(comando_path: str):
+    """Determina el tipo de consulta basado en el endpoint (solo para organización)"""
+    comando = comando_path.lstrip('/').split('/')[0]
+    
+    # Mapeo de comandos a tipos de consulta
+    tipo_por_comando = {
+        'dni': 'DNI_virtual',
+        'dnif': 'DNI_virtual',
+        'dnidb': 'DNI_virtual',
+        'dnifdb': 'DNI_virtual',
+        'dnivaz': 'DNI_virtual',
+        'dnivam': 'DNI_virtual',
+        'dnivel': 'DNI_virtual',
+        'dniveln': 'DNI_virtual',
+        'sbs': 'SBS',
+        'denuncia': 'Denuncias',
+        'dence': 'Denuncias',
+        'denpas': 'Denuncias',
+        'denci': 'Denuncias',
+        'denp': 'Denuncias',
+        'denar': 'Denuncias',
+        'dencl': 'Denuncias',
+        'migrapdf': 'Migraciones',
+        'sunat': 'SUNAT',
+        'sun': 'SUNAT',
+        'antpen': 'Antecedentes',
+        'antpol': 'Antecedentes',
+        'antjud': 'Antecedentes'
+    }
+    
+    return tipo_por_comando.get(comando, 'general')
+
+# --- Aplicación Flask ---
+app = Flask(__name__)
+CORS(app)
+
 # --- Rutas HTTP ---
 
 @app.route("/")
 def root():
     return jsonify({
         "status": "ok",
-        "message": "Gateway API para LEDER DATA Bot activo (SIEMPRE EN TIEMPO REAL).",
+        "message": "Gateway API para LEDER DATA Bot activo (Modo Serverless).",
         "mode": "serverless",
-        "real_time": True,
-        "storage_cache": False,  # ¡IMPORTANTE! Ahora siempre es false
-        "firebase_available": firebase_available,
-        "version": "5.0 - Siempre en tiempo real (sin validación de Storage)"
+        "cost_optimized": True,
+        "version": "4.2 - Sin Storage PE, solo respuestas directas"
     })
 
 @app.route("/status")
@@ -857,13 +701,11 @@ def status():
     
     return jsonify({
         "status": "ready",
-        "real_time": True,  # ¡SIEMPRE en tiempo real!
-        "storage_cache": False,  # ¡Cache desactivado!
         "session_loaded": bool(SESSION_STRING and SESSION_STRING.strip()),
         "api_credentials_ok": API_ID != 0 and bool(API_HASH),
-        "firebase_available": firebase_available,
         "bot_status": bot_status,
         "mode": "on-demand",
+        "storage_pe": "removed",  # Indicar que se eliminó Storage PE
         "timeouts": {
             "primary_bot": TIMEOUT_PRIMARY,
             "backup_bot": TIMEOUT_BACKUP,
@@ -877,7 +719,7 @@ def files(filename):
 
 # --- Función para manejar endpoints ---
 def handle_api_endpoint(endpoint_path):
-    """Manejador genérico para todos los endpoints de API (SIEMPRE EN TIEMPO REAL)"""
+    """Manejador genérico para todos los endpoints de API"""
     command, error = get_command_and_param(endpoint_path, request.args)
     if error:
         return jsonify({"status": "error", "message": error}), 400
@@ -894,8 +736,7 @@ def handle_api_endpoint(endpoint_path):
         
         consulta_id = f"{command_name}_{dni}_{timestamp}"
         
-        # Ejecutar comando SIEMPRE EN TIEMPO REAL
-        print(f"🚀 Ejecutando consulta en tiempo real: {command}")
+        # Ejecutar comando
         result = run_telegram_command(command, consulta_id, endpoint_path)
         
         # Si la respuesta tiene status="error", mantener formato antiguo
@@ -907,8 +748,7 @@ def handle_api_endpoint(endpoint_path):
                 status_code = 404
             return jsonify(result), status_code
         
-        # Agregar flag de tiempo real a la respuesta
-        result["real_time"] = True
+        # Si no tiene status, es el nuevo formato limpio
         return jsonify(result)
         
     except FutureTimeoutError:
@@ -1204,11 +1044,13 @@ def api_dni_nombres():
     command = f"/nm {formatted_nombres}|{formatted_apepaterno}|{formatted_apematerno}"
     
     try:
+        # Generar ID único para esta consulta
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         consulta_id = f"dni_nombres_{timestamp}"
         
         result = run_telegram_command(command, consulta_id, "/dni_nombres")
         
+        # Manejar errores
         if result.get("status") == "error":
             status_code = 500
             if "Formato de consulta incorrecto" in result.get("message", ""):
@@ -1217,7 +1059,6 @@ def api_dni_nombres():
                 status_code = 404
             return jsonify(result), status_code
             
-        result["real_time"] = True
         return jsonify(result)
         
     except FutureTimeoutError:
@@ -1244,11 +1085,13 @@ def api_venezolanos_nombres():
     command = f"/nmv {query}"
     
     try:
+        # Generar ID único para esta consulta
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         consulta_id = f"venezolanos_nombres_{timestamp}"
         
         result = run_telegram_command(command, consulta_id, "/venezolanos_nombres")
         
+        # Manejar errores
         if result.get("status") == "error":
             status_code = 500
             if "Formato de consulta incorrecto" in result.get("message", ""):
@@ -1257,7 +1100,6 @@ def api_venezolanos_nombres():
                 status_code = 404
             return jsonify(result), status_code
             
-        result["real_time"] = True
         return jsonify(result)
         
     except FutureTimeoutError:
@@ -1285,8 +1127,7 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "mode": "serverless",
-        "real_time": True,
-        "storage_cache": False,
+        "storage_pe": "removed",
         "timestamp": datetime.utcnow().isoformat(),
         "session_configured": bool(SESSION_STRING and SESSION_STRING.strip()),
         "features": {
@@ -1294,7 +1135,8 @@ def health_check():
             "idle_timeout": True,
             "clean_json": True,
             "field_extraction": True,
-            "always_real_time": True  # ¡NUEVO! Siempre en tiempo real
+            "bot_failover": True,
+            "bot_blocking": True
         }
     })
 
@@ -1315,65 +1157,22 @@ def debug_bots():
             "timeout": TIMEOUT_BACKUP
         },
         "block_hours": BOT_BLOCK_HOURS,
-        "storage_mode": "real_time_only",  # ¡IMPORTANTE!
-        "firebase_upload": firebase_available
+        "storage_pe": "removed"
     })
 
-# --- Nuevos endpoints para Firebase (solo para subida, no para validación) ---
-@app.route("/firebase/test", methods=["GET"])
-def test_firebase():
-    """Endpoint para probar la conexión a Firebase (solo para subida)"""
-    if not firebase_available:
-        return jsonify({
-            "status": "error",
-            "message": "Firebase SDK no disponible. Las subidas estarán deshabilitadas."
-        }), 500
-    
-    try:
-        client = get_storage_client()
-        if not client:
-            return jsonify({
-                "status": "error",
-                "message": "No se pudo crear cliente de Firebase Storage"
-            }), 500
-        
-        # Probar bucket específico
-        bucket = client.bucket(FIREBASE_STORAGE_BUCKET)
-        bucket_exists = bucket.exists()
-        
-        return jsonify({
-            "status": "ok",
-            "message": "Conexión a Firebase Storage exitosa (solo para subida opcional)",
-            "project": client.project,
-            "configured_bucket": FIREBASE_STORAGE_BUCKET,
-            "bucket_exists": bucket_exists,
-            "client_email": FIREBASE_CLIENT_EMAIL,
-            "usage": "upload_only"  # Solo para subida, no para validación
-        })
-        
-    except Exception as e:
-        print(f"❌ Error detallado Firebase: {str(e)}")
-        traceback.print_exc()
-        return jsonify({
-            "status": "error",
-            "message": f"Error conectando a Firebase Storage: {str(e)}",
-            "usage": "upload_only"
-        }), 500
-
 if __name__ == "__main__":
-    print("🚀 Iniciando backend en modo SERVERLESS (SIEMPRE EN TIEMPO REAL)")
-    print("🔥 MODIFICACIÓN PRINCIPAL: Eliminada validación de Storage")
-    print("✅ Cada consulta se ejecuta SIEMPRE en tiempo real")
-    print("📊 Storage solo se usa para subida opcional de archivos")
+    print("🚀 Iniciando backend en modo SERVERLESS (on-demand)")
+    print("📊 Modo optimizado para costos (<5 USD/mes)")
+    print("🔗 Telethon se conecta solo cuando recibe consultas")
     print(f"⏰ Timeouts: Principal={TIMEOUT_PRIMARY}s, Respaldo={TIMEOUT_BACKUP}s")
     print(f"🔒 Bloqueo bot fallado: {BOT_BLOCK_HOURS} horas")
-    print(f"🔥 Firebase Storage: {'DISPONIBLE para subida' if firebase_available else 'NO DISPONIBLE'}")
     print("✨ MEJORAS IMPLEMENTADAS:")
-    print("   ✓ ELIMINADO: Validación de Storage")
-    print("   ✓ NUEVO: Siempre ejecuta en tiempo real")
-    print("   ✓ MANTENIDO: Descarga de archivos ANTES de desconectar")
-    print("   ✓ MANTENIDO: Captura TODOS los mensajes del bot")
-    print("   ✓ MANTENIDO: JSON LIMPIO sin marcas LEDERDATA")
-    print("   ✓ MANTENIDO: Campos extraídos al nivel raíz")
-    print("   ✓ NUEVO: Flag 'real_time': true en todas las respuestas")
+    print("   ✓ ELIMINADO: Lógica de Storage PE (no funcionaba correctamente)")
+    print("   ✓ FIX: Descarga de archivos ANTES de desconectar cliente")
+    print("   ✓ FIX: Handler removido correctamente para evitar fugas")
+    print("   ✓ Captura TODOS los mensajes del bot (2, 5, 20+ mensajes)")
+    print("   ✓ JSON LIMPIO sin marcas LEDERDATA")
+    print("   ✓ Campos extraídos al nivel raíz (dni, nombres, apellidos, etc.)")
+    print("   ✓ Sistema de failover automático entre bots")
+    print("   ✓ Bloqueo automático de bots que fallan por timeout")
     app.run(host="0.0.0.0", port=PORT, debug=False)
