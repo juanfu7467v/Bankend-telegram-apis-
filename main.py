@@ -15,18 +15,6 @@ from telethon.sessions import StringSession
 from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
 from telethon.errors.rpcerrorlist import UserBlockedError
 
-# Importación CORREGIDA de Firebase
-try:
-    from google.cloud import storage
-    from google.oauth2 import service_account  # ¡NUEVO IMPORT!
-    firebase_available = True
-    print("✅ Firebase SDK disponible")
-except ImportError:
-    print("⚠️ Firebase SDK no disponible. Instala: pip install google-cloud-storage")
-    firebase_available = False
-    storage = None
-    service_account = None
-
 # --- Configuración y Variables de Entorno ---
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
@@ -34,11 +22,23 @@ PUBLIC_URL = os.getenv("PUBLIC_URL", "https://consulta-pe-bot.up.railway.app").r
 SESSION_STRING = os.getenv("SESSION_STRING", None)
 PORT = int(os.getenv("PORT", 8080))
 
-# --- Configuración de Firebase ---
+# --- Configuración de Firebase (mantenida pero no se usará para validación) ---
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "consulta-pe-abf99")
 FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL", "firebase-adminsdk-fbsvc@consulta-pe-abf99.iam.gserviceaccount.com")
 FIREBASE_PRIVATE_KEY = os.getenv("FIREBASE_PRIVATE_KEY", "").replace("\\n", "\n")
 FIREBASE_STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET", "consulta-pe-abf99.appspot.com")
+
+# Importación de Firebase (solo para subida opcional, no para validación)
+try:
+    from google.cloud import storage
+    from google.oauth2 import service_account
+    firebase_available = True
+    print("✅ Firebase SDK disponible (solo para subida opcional)")
+except ImportError:
+    print("⚠️ Firebase SDK no disponible. Las subidas a Storage estarán deshabilitadas.")
+    firebase_available = False
+    storage = None
+    service_account = None
 
 # --- Configuración Interna ---
 DOWNLOAD_DIR = "downloads"
@@ -77,22 +77,20 @@ def record_bot_failure(bot_id: str):
     print(f"🚨 Bot {bot_id} ha fallado y será BLOQUEADO por {BOT_BLOCK_HOURS} horas.")
     bot_fail_tracker[bot_id] = datetime.now()
 
-# --- Funciones de Firebase Storage (MEJORADAS con logs detallados) ---
+# --- Funciones de Firebase Storage (SOLO PARA SUBIDA, NO PARA VALIDACIÓN) ---
 def get_storage_client():
-    """Obtiene el cliente de Firebase Storage - VERSIÓN CORREGIDA"""
+    """Obtiene el cliente de Firebase Storage - SOLO PARA SUBIDA"""
     if not firebase_available or not service_account:
-        print("❌ ERROR: Firebase no disponible al intentar obtener cliente")
+        print("❌ Firebase no disponible para subida de archivos")
         return None
     
     try:
-        # VERIFICAR que tenemos las credenciales necesarias
+        # Verificar credenciales
         if not FIREBASE_PRIVATE_KEY or not FIREBASE_CLIENT_EMAIL:
-            print("❌ ERROR: Faltan credenciales de Firebase (private_key o client_email)")
+            print("❌ Faltan credenciales de Firebase para subida")
             return None
         
-        print(f"🔑 Intentando autenticar Firebase con: {FIREBASE_CLIENT_EMAIL}")
-        
-        # Crear diccionario de credenciales desde variables de entorno - ¡CORRECCIÓN AQUÍ!
+        # Crear diccionario de credenciales
         service_account_info = {
             "type": "service_account",
             "project_id": FIREBASE_PROJECT_ID,
@@ -112,104 +110,32 @@ def get_storage_client():
             credentials=credentials
         )
         
-        print("✅ Cliente de Firebase Storage creado exitosamente con credenciales explícitas")
+        print("✅ Cliente de Firebase Storage creado (solo para subida)")
         return client
         
     except Exception as e:
-        print(f"❌ ERROR CRÍTICO al conectar con Firebase Storage: {str(e)}")
-        traceback.print_exc()
-        return None
-
-def archivos_existentes_en_storage(consulta_id: str, tipo_consulta: str = None):
-    """
-    Revisa si los archivos ya existen en Firebase Storage
-    """
-    if not firebase_available:
-        print("❌ Firebase no disponible para verificar archivos existentes")
-        return None
-    
-    try:
-        client = get_storage_client()
-        if not client:
-            print("❌ No se pudo obtener cliente de Firebase Storage")
-            return None
-        
-        bucket = client.bucket(FIREBASE_STORAGE_BUCKET)
-        print(f"✅ Bucket de Firebase obtenido: {FIREBASE_STORAGE_BUCKET}")
-        
-        # Construir el prefijo según tipo de consulta
-        if tipo_consulta:
-            prefix = f"resultados/{tipo_consulta}/{consulta_id}/"
-        else:
-            # Buscar en cualquier tipo de consulta
-            prefixes = [f"resultados/{tipo}/{consulta_id}/" for tipo in ["DNI_virtual", "SBS", "Denuncias", "general"]]
-            all_blobs = []
-            for prefix in prefixes:
-                try:
-                    blobs = list(bucket.list_blobs(prefix=prefix))
-                    if blobs:
-                        all_blobs.extend(blobs)
-                except Exception as e:
-                    print(f"⚠️ Error listando blobs con prefijo {prefix}: {e}")
-            
-            if all_blobs:
-                urls = []
-                for blob in all_blobs:
-                    try:
-                        if not blob.public_url:
-                            blob.make_public()
-                        urls.append(blob.public_url)
-                    except Exception as e:
-                        print(f"⚠️ Error obteniendo URL pública para blob: {e}")
-                print(f"✅ Encontrados {len(urls)} archivos en Firebase Storage")
-                return urls
-            print(f"ℹ️ No se encontraron archivos en Storage para consulta {consulta_id}")
-            return None
-        
-        try:
-            blobs = list(bucket.list_blobs(prefix=prefix))
-            if blobs:
-                urls = []
-                for blob in blobs:
-                    try:
-                        if not blob.public_url:
-                            blob.make_public()
-                        urls.append(blob.public_url)
-                    except Exception as e:
-                        print(f"⚠️ Error obteniendo URL pública para blob: {e}")
-                print(f"✅ Encontrados {len(urls)} archivos en Firebase Storage con prefijo {prefix}")
-                return urls
-            print(f"ℹ️ No se encontraron archivos en Storage con prefijo {prefix}")
-            return None
-            
-        except Exception as e:
-            print(f"❌ Error listando blobs con prefijo {prefix}: {e}")
-            return None
-        
-    except Exception as e:
-        print(f"❌ ERROR CRÍTICO al verificar archivos en Storage: {str(e)}")
+        print(f"❌ ERROR al conectar con Firebase Storage para subida: {str(e)}")
         traceback.print_exc()
         return None
 
 def subir_archivos_a_storage(files_data, consulta_id: str, tipo_consulta: str = None):
     """
-    Sube todos los archivos recibidos a Firebase Storage
+    Sube todos los archivos recibidos a Firebase Storage (OPCIONAL)
     files_data: lista de tuplas (filename, file_content, content_type)
     """
     if not firebase_available:
-        print("❌ ERROR: Firebase no disponible al intentar subir.")
+        print("❌ Firebase no disponible para subida de archivos")
         return None
     
     try:
         client = get_storage_client()
         if not client:
-            print("❌ No se pudo crear cliente de Firebase Storage")
+            print("❌ No se pudo crear cliente de Firebase Storage para subida")
             return None
         
         bucket = client.bucket(FIREBASE_STORAGE_BUCKET)
-        print(f"✅ Bucket de Firebase listo: {FIREBASE_STORAGE_BUCKET}")
+        print(f"✅ Bucket de Firebase listo para subida: {FIREBASE_STORAGE_BUCKET}")
         
-        # Determinar tipo de consulta para organización
         if not tipo_consulta:
             tipo_consulta = determinar_tipo_consulta_por_comando(request.path)
         
@@ -223,7 +149,6 @@ def subir_archivos_a_storage(files_data, consulta_id: str, tipo_consulta: str = 
                 # Obtener extensión del archivo
                 file_ext = os.path.splitext(filename)[1] if filename else '.jpg'
                 if not file_ext or file_ext == '.':
-                    # Determinar extensión basada en content_type
                     if content_type:
                         if 'pdf' in content_type.lower():
                             file_ext = '.pdf'
@@ -243,13 +168,9 @@ def subir_archivos_a_storage(files_data, consulta_id: str, tipo_consulta: str = 
                 
                 # Subir archivo
                 blob = bucket.blob(storage_path)
-                
-                # Configurar metadata
                 blob.content_type = content_type or mimetypes.guess_type(filename)[0] if filename else 'application/octet-stream'
                 
                 print(f"   Subiendo a: {storage_path} ({len(file_content)} bytes)")
-                
-                # Subir contenido
                 blob.upload_from_string(file_content, content_type=blob.content_type)
                 
                 # Hacer público
@@ -257,7 +178,7 @@ def subir_archivos_a_storage(files_data, consulta_id: str, tipo_consulta: str = 
                 
                 urls.append({
                     "url": blob.public_url,
-                    "type": "document",  # Siempre "document" para consistencia
+                    "type": "document",
                     "filename": unique_filename
                 })
                 
@@ -266,16 +187,13 @@ def subir_archivos_a_storage(files_data, consulta_id: str, tipo_consulta: str = 
                 
             except Exception as e:
                 print(f"❌ ERROR subiendo archivo {idx}: {str(e)}")
-                traceback.print_exc()
                 continue
         
-        print(f"📊 Resumen: {successful_uploads}/{len(files_data)} archivos subidos exitosamente a Firebase")
+        print(f"📊 Resumen subida: {successful_uploads}/{len(files_data)} archivos subidos a Firebase")
         return urls if successful_uploads > 0 else None
         
     except Exception as e:
-        # ESTO ES CLAVE: Ver el error real en los logs de Railway/Fly.io
-        print(f"❌ FALLO CRÍTICO FIREBASE: {str(e)}")
-        traceback.print_exc()
+        print(f"❌ FALLO en subida a Firebase: {str(e)}")
         return None
 
 def determinar_tipo_consulta_por_comando(comando_path: str):
@@ -381,13 +299,11 @@ def clean_and_extract(raw_text: str):
     
     return {"text": text, "fields": fields}
 
-# --- Función Principal para Conexión On-Demand (MEJORADA para JSON limpio) ---
+# --- Función Principal para Conexión On-Demand (MODIFICADA: SIN VALIDACIÓN DE STORAGE) ---
 async def send_telegram_command(command: str, consulta_id: str = None, endpoint_path: str = None):
     """
-    Función on-demand con soporte para múltiples archivos y Firebase Storage
-    MEJORADA: Captura TODOS los mensajes y archivos del bot
-    MEJORADA: Devuelve JSON limpio sin marcas LEDERDATA
-    CORREGIDA: Evita desconexión prematura
+    Función on-demand SIN validación de Storage
+    Cada consulta se ejecuta siempre en tiempo real
     """
     client = None
     handler_removed = False
@@ -414,7 +330,7 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
         dni_match = re.search(r"/\w+\s+(\d{8,11})", command)
         dni = dni_match.group(1) if dni_match else None
         
-        # 5. Determinar tipo de consulta para Firebase
+        # 5. Determinar tipo de consulta (solo para organización de archivos)
         tipo_consulta = determinar_tipo_consulta_por_comando(endpoint_path) if endpoint_path else "general"
         
         # 6. Generar consulta_id si no se proporciona
@@ -422,26 +338,7 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
             consulta_id = f"{tipo_consulta}_{dni or 'unknown'}_{timestamp}" if dni else f"{tipo_consulta}_{timestamp}"
         
-        # 7. Verificar si ya existen archivos en Firebase Storage
-        urls_existentes = archivos_existentes_en_storage(consulta_id, tipo_consulta)
-        if urls_existentes and firebase_available:
-            print(f"✅ Archivos encontrados en Firebase Storage para consulta {consulta_id}")
-            # Extraer campos básicos del comando
-            response_data = {
-                "dni": dni,
-                "total_files": len(urls_existentes),
-                "total_messages": 1,
-                "urls": [{"type": "document", "url": url} for url in urls_existentes],
-                "from_cache": True,
-                "consulta_id": consulta_id
-            }
-            
-            # Limpiar campos None
-            response_data = {k: v for k, v in response_data.items() if v is not None}
-            
-            return response_data
-        
-        # 8. Determinar orden de bots según bloqueos
+        # 7. Determinar orden de bots según bloqueos
         bots_order = []
         
         if not is_bot_blocked(LEDERDATA_BOT_ID):
@@ -455,16 +352,15 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
         
         print(f"🔍 Orden de intentos: {bots_order}")
         
-        # 9. Variables para capturar respuestas
+        # 8. Variables para capturar respuestas
         all_received_messages = []  # Para múltiples mensajes del MISMO bot
-        all_files_data = []  # Para almacenar archivos para Firebase
-        all_download_tasks = []  # ¡NUEVO: Para trackear descargas activas!
+        all_files_data = []  # Para almacenar archivos
         stop_collecting = asyncio.Event()
         
         # Variable para trackear última actividad
         last_message_time = [time.time()]  # Usamos lista para poder modificar desde el handler
         
-        # 10. Handler temporal para capturar respuestas (MEJORADO)
+        # 9. Handler temporal para capturar respuestas
         @client.on(events.NewMessage(incoming=True))
         async def temp_handler(event):
             # Si ya tenemos respuesta completa, ignorar nuevos mensajes
@@ -507,29 +403,27 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                     "fields": cleaned["fields"],
                     "urls": [],
                     "bot_id": current_bot_entity.id if current_bot_entity else None,
-                    "event_message": event.message  # ¡NUEVO: Guardar el objeto completo para descargas posteriores
+                    "event_message": event.message  # Guardar el objeto completo para descargas
                 }
                 
                 all_received_messages.append(msg_obj)
                 print(f"📥 Mensaje recibido de bot: {len(msg_obj['message'])} chars")
                 
                 # Verificar si es error de formato, pero NO detener inmediatamente
-                # El bot podría seguir enviando más mensajes
                 if ("Por favor, usa el formato correcto" in msg_obj["message"]):
                     print("⚠️ Error de formato detectado, pero continuamos escuchando por si hay más")
                 
             except Exception as e:
                 print(f"Error en handler temporal: {e}")
         
-        # 11. Intentar SECUENCIALMENTE con cada bot
+        # 10. Intentar SECUENCIALMENTE con cada bot (SIEMPRE en tiempo real)
         for attempt, current_bot_id in enumerate(bots_order, 1):
-            print(f"\n🎯 Intento {attempt}: Enviando a {current_bot_id}")
+            print(f"\n🎯 Intento {attempt}: Enviando a {current_bot_id} (SIEMPRE EN TIEMPO REAL)")
             print(f"   Comando: {command}")
             
             # Resetear para este intento
             all_received_messages = []
             all_files_data = []
-            all_download_tasks = []  # ¡NUEVO: Resetear tareas de descarga
             stop_collecting.clear()
             last_message_time[0] = time.time()
             
@@ -538,7 +432,7 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                 timeout = TIMEOUT_PRIMARY if current_bot_id == LEDERDATA_BOT_ID else TIMEOUT_BACKUP
                 print(f"   Timeout configurado: {timeout}s")
                 
-                # Enviar comando
+                # Enviar comando (SIEMPRE en tiempo real)
                 await client.send_message(current_bot_id, command)
                 
                 # Timer para múltiples mensajes
@@ -582,8 +476,8 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                         # No hay más bots, lanzar error
                         raise Exception(f"Ningún bot respondió. Último timeout: {timeout}s")
                 
-                # 12. SI LLEGAMOS AQUÍ, EL BOT RESPONDIÓ
-                print(f"✅ {current_bot_id} respondió con {len(all_received_messages)} mensajes")
+                # 11. SI LLEGAMOS AQUÍ, EL BOT RESPONDIÓ EN TIEMPO REAL
+                print(f"✅ {current_bot_id} respondió en tiempo real con {len(all_received_messages)} mensajes")
                 
                 # Marcar para detener cualquier espera futura
                 stop_collecting.set()
@@ -662,7 +556,7 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                                         timestamp_str = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
                                         unique_filename = f"{timestamp_str}_{event_msg.id}{dni_part}{type_part}_{i}{file_ext}"
                                         
-                                        # DESCARGAR ARCHIVO SÍNCRONO - ¡IMPORTANTE!
+                                        # DESCARGAR ARCHIVO SÍNCRONO
                                         print(f"   Descargando archivo {i+1} del mensaje {idx+1}...")
                                         
                                         # Verificar que el cliente siga conectado
@@ -675,12 +569,12 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                                             file=os.path.join(DOWNLOAD_DIR, unique_filename)
                                         )
                                         
-                                        # Leer contenido para Firebase
+                                        # Leer contenido
                                         if saved_path and os.path.exists(saved_path):
                                             with open(saved_path, 'rb') as f:
                                                 file_content = f.read()
                                             
-                                            # Guardar para subir a Firebase
+                                            # Guardar para posible subida a Firebase
                                             all_files_data.append((unique_filename, file_content, content_type))
                                             
                                             # URL local temporal
@@ -708,7 +602,7 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                         client.remove_event_handler(temp_handler)
                         handler_removed = True
                     
-                    # --- CONSOLIDAR CAMPOS DE TODOS LOS MENSAJES (MEJORADO) ---
+                    # --- CONSOLIDAR CAMPOS DE TODOS LOS MENSAJES ---
                     final_fields = {}
                     urls_temporales = []
                     
@@ -722,43 +616,41 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                         # Extraer URLs temporales
                         if isinstance(msg.get("urls"), list):
                             for url_obj in msg["urls"]:
-                                # Solo tipo y URL, sin text_context
                                 urls_temporales.append({
                                     "type": url_obj.get("type", "document"),
                                     "url": url_obj.get("url")
                                 })
                     
-                    # 13. SUBIR ARCHIVOS A FIREBASE STORAGE (OBLIGATORIO)
+                    # 12. SUBIR ARCHIVOS A FIREBASE STORAGE (OPCIONAL, NO OBLIGATORIO)
                     urls_finales = []
                     firebase_upload_success = False
                     
                     if all_files_data and firebase_available:
-                        print(f"📤 Intentando subir {len(all_files_data)} archivos a Firebase Storage...")
+                        print(f"📤 Intentando subir {len(all_files_data)} archivos a Firebase Storage (opcional)...")
                         firebase_res = subir_archivos_a_storage(all_files_data, consulta_id, tipo_consulta)
                         if firebase_res:
                             urls_finales = firebase_res  # Usar URLs permanentes de Firebase
                             firebase_upload_success = True
                             print(f"✅ {len(firebase_res)} archivos subidos exitosamente a Firebase")
                         else:
-                            # Si falla Firebase, usar las locales pero marcar advertencia en logs
-                            print("⚠️ Usando URLs locales temporales porque Firebase falló")
+                            print("⚠️ Falló subida a Firebase, usando URLs locales")
                             urls_finales = urls_temporales
-                    elif all_files_data and not firebase_available:
-                        print("⚠️ Firebase no disponible, usando URLs locales")
+                    else:
                         urls_finales = urls_temporales
                     
-                    # 14. CONSTRUIR RESPUESTA LIMPIA
+                    # 13. CONSTRUIR RESPUESTA LIMPIA
                     response_data = {}
                     
                     # Agregar campos extraídos al nivel raíz
                     for key, value in final_fields.items():
-                        if value:  # Solo agregar si tiene valor
+                        if value:
                             response_data[key] = value
                     
                     # Agregar metadatos
                     response_data["total_files"] = len(urls_finales)
                     response_data["total_messages"] = len(all_received_messages)
                     response_data["urls"] = urls_finales
+                    response_data["real_time"] = True  # Indicar que fue en tiempo real
                     
                     if firebase_upload_success:
                         response_data["storage"] = "firebase"
@@ -768,7 +660,6 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                     return response_data
                 else:
                     # Caso raro: sin mensajes recibidos
-                    # Remover handler antes de desconectar
                     if client and not handler_removed:
                         client.remove_event_handler(temp_handler)
                         handler_removed = True
@@ -812,11 +703,11 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
     except Exception as e:
         return {
             "status": "error",
-            "message": f"Error al procesar comando: {str(e)}"
+            "message": f"Error al procesar comando en tiempo real: {str(e)}"
         }
         
     finally:
-        # 15. Limpieza final - ¡AHORA SÍ podemos desconectar!
+        # 14. Limpieza final
         if client:
             try:
                 # Asegurarnos de que el handler ya fue removido
@@ -944,11 +835,12 @@ def get_command_and_param(path, request_args):
 def root():
     return jsonify({
         "status": "ok",
-        "message": "Gateway API para LEDER DATA Bot activo (Modo Serverless con Firebase).",
+        "message": "Gateway API para LEDER DATA Bot activo (SIEMPRE EN TIEMPO REAL).",
         "mode": "serverless",
+        "real_time": True,
+        "storage_cache": False,  # ¡IMPORTANTE! Ahora siempre es false
         "firebase_available": firebase_available,
-        "cost_optimized": True,
-        "version": "4.1 - Firebase FIXED y desconexión mejorada"
+        "version": "5.0 - Siempre en tiempo real (sin validación de Storage)"
     })
 
 @app.route("/status")
@@ -963,24 +855,13 @@ def status():
             "block_hours": BOT_BLOCK_HOURS if is_blocked else 0
         }
     
-    # Verificar Firebase explícitamente
-    firebase_test = False
-    if firebase_available:
-        try:
-            client = get_storage_client()
-            if client:
-                firebase_test = True
-        except:
-            pass
-    
     return jsonify({
         "status": "ready",
+        "real_time": True,  # ¡SIEMPRE en tiempo real!
+        "storage_cache": False,  # ¡Cache desactivado!
         "session_loaded": bool(SESSION_STRING and SESSION_STRING.strip()),
         "api_credentials_ok": API_ID != 0 and bool(API_HASH),
         "firebase_available": firebase_available,
-        "firebase_working": firebase_test,
-        "firebase_bucket": FIREBASE_STORAGE_BUCKET if firebase_available else "no configurado",
-        "firebase_client_email": FIREBASE_CLIENT_EMAIL if firebase_available else "no configurado",
         "bot_status": bot_status,
         "mode": "on-demand",
         "timeouts": {
@@ -996,7 +877,7 @@ def files(filename):
 
 # --- Función para manejar endpoints ---
 def handle_api_endpoint(endpoint_path):
-    """Manejador genérico para todos los endpoints de API"""
+    """Manejador genérico para todos los endpoints de API (SIEMPRE EN TIEMPO REAL)"""
     command, error = get_command_and_param(endpoint_path, request.args)
     if error:
         return jsonify({"status": "error", "message": error}), 400
@@ -1013,7 +894,8 @@ def handle_api_endpoint(endpoint_path):
         
         consulta_id = f"{command_name}_{dni}_{timestamp}"
         
-        # Ejecutar comando
+        # Ejecutar comando SIEMPRE EN TIEMPO REAL
+        print(f"🚀 Ejecutando consulta en tiempo real: {command}")
         result = run_telegram_command(command, consulta_id, endpoint_path)
         
         # Si la respuesta tiene status="error", mantener formato antiguo
@@ -1025,7 +907,8 @@ def handle_api_endpoint(endpoint_path):
                 status_code = 404
             return jsonify(result), status_code
         
-        # Si no tiene status, es el nuevo formato limpio
+        # Agregar flag de tiempo real a la respuesta
+        result["real_time"] = True
         return jsonify(result)
         
     except FutureTimeoutError:
@@ -1321,13 +1204,11 @@ def api_dni_nombres():
     command = f"/nm {formatted_nombres}|{formatted_apepaterno}|{formatted_apematerno}"
     
     try:
-        # Generar ID único para esta consulta
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         consulta_id = f"dni_nombres_{timestamp}"
         
         result = run_telegram_command(command, consulta_id, "/dni_nombres")
         
-        # Manejar errores
         if result.get("status") == "error":
             status_code = 500
             if "Formato de consulta incorrecto" in result.get("message", ""):
@@ -1336,6 +1217,7 @@ def api_dni_nombres():
                 status_code = 404
             return jsonify(result), status_code
             
+        result["real_time"] = True
         return jsonify(result)
         
     except FutureTimeoutError:
@@ -1362,13 +1244,11 @@ def api_venezolanos_nombres():
     command = f"/nmv {query}"
     
     try:
-        # Generar ID único para esta consulta
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         consulta_id = f"venezolanos_nombres_{timestamp}"
         
         result = run_telegram_command(command, consulta_id, "/venezolanos_nombres")
         
-        # Manejar errores
         if result.get("status") == "error":
             status_code = 500
             if "Formato de consulta incorrecto" in result.get("message", ""):
@@ -1377,6 +1257,7 @@ def api_venezolanos_nombres():
                 status_code = 404
             return jsonify(result), status_code
             
+        result["real_time"] = True
         return jsonify(result)
         
     except FutureTimeoutError:
@@ -1401,36 +1282,19 @@ def login_info():
 
 @app.route("/health", methods=["GET"])
 def health_check():
-    # Probar Firebase explícitamente
-    firebase_test = False
-    firebase_error = None
-    if firebase_available:
-        try:
-            client = get_storage_client()
-            if client:
-                # Intentar una operación simple
-                bucket = client.bucket(FIREBASE_STORAGE_BUCKET)
-                firebase_test = bucket.exists()
-        except Exception as e:
-            firebase_error = str(e)
-    
     return jsonify({
         "status": "healthy",
         "mode": "serverless",
-        "firebase": {
-            "available": firebase_available,
-            "working": firebase_test,
-            "error": firebase_error,
-            "bucket": FIREBASE_STORAGE_BUCKET if firebase_available else None
-        },
+        "real_time": True,
+        "storage_cache": False,
         "timestamp": datetime.utcnow().isoformat(),
         "session_configured": bool(SESSION_STRING and SESSION_STRING.strip()),
         "features": {
             "multiple_messages": True,
             "idle_timeout": True,
-            "firebase_storage": firebase_available,
             "clean_json": True,
-            "field_extraction": True
+            "field_extraction": True,
+            "always_real_time": True  # ¡NUEVO! Siempre en tiempo real
         }
     })
 
@@ -1451,22 +1315,18 @@ def debug_bots():
             "timeout": TIMEOUT_BACKUP
         },
         "block_hours": BOT_BLOCK_HOURS,
-        "firebase": {
-            "available": firebase_available,
-            "bucket": FIREBASE_STORAGE_BUCKET if firebase_available else None,
-            "project": FIREBASE_PROJECT_ID if firebase_available else None,
-            "client_email": FIREBASE_CLIENT_EMAIL if firebase_available else None
-        }
+        "storage_mode": "real_time_only",  # ¡IMPORTANTE!
+        "firebase_upload": firebase_available
     })
 
-# --- Nuevos endpoints para Firebase ---
+# --- Nuevos endpoints para Firebase (solo para subida, no para validación) ---
 @app.route("/firebase/test", methods=["GET"])
 def test_firebase():
-    """Endpoint para probar la conexión a Firebase"""
+    """Endpoint para probar la conexión a Firebase (solo para subida)"""
     if not firebase_available:
         return jsonify({
             "status": "error",
-            "message": "Firebase SDK no disponible. Instala: pip install google-cloud-storage"
+            "message": "Firebase SDK no disponible. Las subidas estarán deshabilitadas."
         }), 500
     
     try:
@@ -1483,12 +1343,12 @@ def test_firebase():
         
         return jsonify({
             "status": "ok",
-            "message": "Conexión a Firebase Storage exitosa",
+            "message": "Conexión a Firebase Storage exitosa (solo para subida opcional)",
             "project": client.project,
             "configured_bucket": FIREBASE_STORAGE_BUCKET,
             "bucket_exists": bucket_exists,
             "client_email": FIREBASE_CLIENT_EMAIL,
-            "auth_method": "service_account_credentials"
+            "usage": "upload_only"  # Solo para subida, no para validación
         })
         
     except Exception as e:
@@ -1497,59 +1357,23 @@ def test_firebase():
         return jsonify({
             "status": "error",
             "message": f"Error conectando a Firebase Storage: {str(e)}",
-            "debug_info": {
-                "project_id": FIREBASE_PROJECT_ID,
-                "client_email": FIREBASE_CLIENT_EMAIL,
-                "private_key_configured": bool(FIREBASE_PRIVATE_KEY)
-            }
-        }), 500
-
-@app.route("/firebase/files/<consulta_id>", methods=["GET"])
-def get_firebase_files(consulta_id):
-    """Obtener archivos de una consulta específica desde Firebase"""
-    if not firebase_available:
-        return jsonify({
-            "status": "error",
-            "message": "Firebase no disponible"
-        }), 500
-    
-    try:
-        urls = archivos_existentes_en_storage(consulta_id)
-        if urls:
-            return jsonify({
-                "status": "ok",
-                "consulta_id": consulta_id,
-                "files_count": len(urls),
-                "urls": urls
-            })
-        else:
-            return jsonify({
-                "status": "not_found",
-                "message": f"No se encontraron archivos para la consulta {consulta_id}"
-            }), 404
-            
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": f"Error obteniendo archivos: {str(e)}"
+            "usage": "upload_only"
         }), 500
 
 if __name__ == "__main__":
-    print("🚀 Iniciando backend en modo SERVERLESS (on-demand) con Firebase")
-    print("📊 Modo optimizado para costos (<5 USD/mes)")
-    print("🔗 Telethon se conecta solo cuando recibe consultas")
+    print("🚀 Iniciando backend en modo SERVERLESS (SIEMPRE EN TIEMPO REAL)")
+    print("🔥 MODIFICACIÓN PRINCIPAL: Eliminada validación de Storage")
+    print("✅ Cada consulta se ejecuta SIEMPRE en tiempo real")
+    print("📊 Storage solo se usa para subida opcional de archivos")
     print(f"⏰ Timeouts: Principal={TIMEOUT_PRIMARY}s, Respaldo={TIMEOUT_BACKUP}s")
     print(f"🔒 Bloqueo bot fallado: {BOT_BLOCK_HOURS} horas")
-    print(f"🔥 Firebase Storage: {'CONECTADO' if firebase_available else 'NO DISPONIBLE'}")
-    if firebase_available:
-        print(f"   Bucket: {FIREBASE_STORAGE_BUCKET}")
-        print(f"   Client Email: {FIREBASE_CLIENT_EMAIL}")
-        print(f"   Auth Method: Service Account Credentials")
+    print(f"🔥 Firebase Storage: {'DISPONIBLE para subida' if firebase_available else 'NO DISPONIBLE'}")
     print("✨ MEJORAS IMPLEMENTADAS:")
-    print("   ✓ FIX: Credenciales explícitas de Firebase (NO más DefaultCredentialsError)")
-    print("   ✓ FIX: Descarga de archivos ANTES de desconectar cliente")
-    print("   ✓ FIX: Handler removido correctamente para evitar fugas")
-    print("   ✓ Captura TODOS los mensajes del bot (2, 5, 20+ mensajes)")
-    print("   ✓ JSON LIMPIO sin marcas LEDERDATA")
-    print("   ✓ Campos extraídos al nivel raíz (dni, nombres, apellidos, etc.)")
+    print("   ✓ ELIMINADO: Validación de Storage")
+    print("   ✓ NUEVO: Siempre ejecuta en tiempo real")
+    print("   ✓ MANTENIDO: Descarga de archivos ANTES de desconectar")
+    print("   ✓ MANTENIDO: Captura TODOS los mensajes del bot")
+    print("   ✓ MANTENIDO: JSON LIMPIO sin marcas LEDERDATA")
+    print("   ✓ MANTENIDO: Campos extraídos al nivel raíz")
+    print("   ✓ NUEVO: Flag 'real_time': true en todas las respuestas")
     app.run(host="0.0.0.0", port=PORT, debug=False)
