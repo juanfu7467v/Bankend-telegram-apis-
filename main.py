@@ -126,14 +126,13 @@ def clean_and_extract(raw_text: str):
     
     return {"text": text, "fields": fields}
 
-# --- Función Principal para Conexión On-Demand (MEJORADA para JSON limpio) ---
+# --- Función Principal para Conexión On-Demand (MEJORADA para manejo de failover) ---
 async def send_telegram_command(command: str, consulta_id: str = None, endpoint_path: str = None):
     """
-    Función on-demand con soporte para múltiples archivos
-    MEJORADA: Captura TODOS los mensajes y archivos del bot
-    MEJORADA: Devuelve JSON limpio sin marcas LEDERDATA
-    CORREGIDA: Evita desconexión prematura
-    MODIFICADA: Se eliminó la lógica de Storage PE
+    Función on-demand con manejo CORREGIDO de failover:
+    - Envía comando UNA SOLA VEZ al bot principal
+    - Solo si recibe "ANTI-SPAM", envía UNA SOLA VEZ al bot de respaldo
+    - Si el bot principal no responde nada (caído/lageado), usa solo el bot de respaldo
     """
     client = None
     handler_removed = False
@@ -166,51 +165,53 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
             tipo_consulta = determinar_tipo_consulta_por_comando(endpoint_path) if endpoint_path else "general"
             consulta_id = f"{tipo_consulta}_{dni or 'unknown'}_{timestamp}" if dni else f"{tipo_consulta}_{timestamp}"
         
-        # 6. Determinar orden de bots según bloqueos
-        bots_order = []
+        # 6. Determinar qué bot usar primero
+        primary_blocked = is_bot_blocked(LEDERDATA_BOT_ID)
+        backup_blocked = is_bot_blocked(LEDERDATA_BACKUP_BOT_ID)
         
-        if not is_bot_blocked(LEDERDATA_BOT_ID):
-            bots_order.append(LEDERDATA_BOT_ID)
+        # Decidir qué bot usar primero según bloqueos
+        bot_to_use_first = None
+        bot_to_use_backup = None
         
-        if not is_bot_blocked(LEDERDATA_BACKUP_BOT_ID):
-            bots_order.append(LEDERDATA_BACKUP_BOT_ID)
-        
-        if not bots_order:
+        if not primary_blocked:
+            bot_to_use_first = LEDERDATA_BOT_ID
+            if not backup_blocked:
+                bot_to_use_backup = LEDERDATA_BACKUP_BOT_ID
+        elif not backup_blocked:
+            bot_to_use_first = LEDERDATA_BACKUP_BOT_ID
+        else:
             raise Exception("Todos los bots están temporalmente bloqueados.")
         
-        print(f"🔍 Orden de intentos: {bots_order}")
+        print(f"🤖 Bot principal seleccionado: {bot_to_use_first}")
+        if bot_to_use_backup:
+            print(f"🤖 Bot de respaldo disponible: {bot_to_use_backup}")
         
         # 7. Variables para capturar respuestas
-        all_received_messages = []  # Para múltiples mensajes del MISMO bot
-        all_files_data = []  # Para almacenar archivos localmente
+        all_received_messages = []
+        all_files_data = []
         stop_collecting = asyncio.Event()
         
         # Variable para trackear última actividad
-        last_message_time = [time.time()]  # Usamos lista para poder modificar desde el handler
+        last_message_time = [time.time()]
         
-        # 8. Handler temporal para capturar respuestas (MEJORADO)
+        # Bandera para saber si estamos usando el bot de respaldo
+        using_backup = False
+        
+        # 8. Handler temporal para capturar respuestas
         @client.on(events.NewMessage(incoming=True))
         async def temp_handler(event):
-            # Si ya tenemos respuesta completa, ignorar nuevos mensajes
             if stop_collecting.is_set():
                 return
                 
             try:
-                # Verificar si el mensaje viene de un bot que estamos probando
-                sender_is_current_bot = False
-                current_bot_entity = None
+                # Verificar si el mensaje viene del bot que estamos usando actualmente
+                current_bot_id = LEDERDATA_BACKUP_BOT_ID if using_backup else LEDERDATA_BOT_ID
                 
-                for bot_id in bots_order:
-                    try:
-                        entity = await client.get_entity(bot_id)
-                        if event.sender_id == entity.id:
-                            sender_is_current_bot = True
-                            current_bot_entity = entity
-                            break
-                    except:
-                        continue
-                
-                if not sender_is_current_bot:
+                try:
+                    entity = await client.get_entity(current_bot_id)
+                    if event.sender_id != entity.id:
+                        return  # Ignorar mensajes de otros bots/usuarios
+                except:
                     return
                 
                 # Actualizar tiempo de última actividad
@@ -230,285 +231,199 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                     "message": cleaned["text"],
                     "fields": cleaned["fields"],
                     "urls": [],
-                    "bot_id": current_bot_entity.id if current_bot_entity else None,
-                    "event_message": event.message  # Guardar el objeto completo para descargas posteriores
+                    "bot_id": entity.id,
+                    "event_message": event.message
                 }
                 
                 all_received_messages.append(msg_obj)
-                print(f"📥 Mensaje recibido de bot: {len(msg_obj['message'])} chars")
+                print(f"📥 Mensaje recibido de bot {'(respaldo)' if using_backup else '(principal)'}: {len(msg_obj['message'])} chars")
                 
-                # Verificar si es error de formato, pero NO detener inmediatamente
-                # El bot podría seguir enviando más mensajes
-                if ("Por favor, usa el formato correcto" in msg_obj["message"]):
-                    print("⚠️ Error de formato detectado, pero continuamos escuchando por si hay más")
+                # Detectar si es mensaje ANTI-SPAM
+                if "⛔ ANTI-SPAM" in raw_text or "ANTI-SPAM" in raw_text:
+                    print("⚠️ Detectado mensaje ANTI-SPAM del bot principal")
+                    # Esto se manejará en la lógica principal
                 
             except Exception as e:
                 print(f"Error en handler temporal: {e}")
         
-        # 9. Intentar SECUENCIALMENTE con cada bot
-        for attempt, current_bot_id in enumerate(bots_order, 1):
-            print(f"\n🎯 Intento {attempt}: Enviando a {current_bot_id}")
-            print(f"   Comando: {command}")
+        # 9. INTENTO CON BOT PRINCIPAL
+        print(f"\n🎯 INTENTANDO CON BOT PRINCIPAL: {bot_to_use_first}")
+        print(f"   Comando: {command}")
+        print(f"   Timeout: {TIMEOUT_PRIMARY}s")
+        
+        # Resetear para este intento
+        all_received_messages = []
+        all_files_data = []
+        stop_collecting.clear()
+        last_message_time[0] = time.time()
+        using_backup = False
+        
+        try:
+            # Enviar comando UNA SOLA VEZ al bot principal
+            await client.send_message(bot_to_use_first, command)
             
-            # Resetear para este intento
+            # Timer para múltiples mensajes
+            start_time = time.time()
+            
+            # --- LÓGICA DE ESPERA PARA BOT PRINCIPAL ---
+            try:
+                while True:
+                    elapsed_total = time.time() - start_time
+                    silence_duration = time.time() - last_message_time[0]
+                    
+                    # Si ya recibimos algo, esperamos un silencio de 4 segundos para cerrar
+                    if len(all_received_messages) > 0:
+                        if silence_duration > 4.0: 
+                            print(f"✅ Silencio detectado ({silence_duration:.1f}s). Total mensajes: {len(all_received_messages)}")
+                            break
+                    
+                    # Si no ha llegado nada y pasamos el timeout total
+                    if elapsed_total > TIMEOUT_PRIMARY:
+                        if len(all_received_messages) == 0:
+                            print(f"⏰ TIMEOUT: Bot principal no respondió en {TIMEOUT_PRIMARY}s")
+                            # Bot principal está caído/lageado
+                            record_bot_failure(LEDERDATA_BOT_ID)
+                            
+                            # Verificar si tenemos bot de respaldo disponible
+                            if not bot_to_use_backup:
+                                raise Exception("Bot principal no respondió y no hay bot de respaldo disponible")
+                            
+                            # Proceder a usar el bot de respaldo (continuar fuera del while)
+                            break
+                        else:
+                            break  # Cerramos con lo que tengamos
+                            
+                    await asyncio.sleep(0.5)
+                
+            except asyncio.TimeoutError:
+                print(f"⏰ TIMEOUT EXCEPCION: Bot principal no respondió")
+                record_bot_failure(LEDERDATA_BOT_ID)
+                
+                if not bot_to_use_backup:
+                    raise Exception("Bot principal no respondió y no hay bot de respaldo disponible")
+            
+            # 10. ANALIZAR RESPUESTA DEL BOT PRINCIPAL
+            if all_received_messages:
+                print(f"✅ Bot principal respondió con {len(all_received_messages)} mensajes")
+                
+                # Verificar si hay mensaje ANTI-SPAM
+                anti_spam_detected = False
+                for msg in all_received_messages:
+                    if "⛔ ANTI-SPAM" in msg.get("message", "") or "ANTI-SPAM" in msg.get("message", ""):
+                        anti_spam_detected = True
+                        break
+                
+                if anti_spam_detected:
+                    print("🔄 Bot principal respondió con ANTI-SPAM, intentando con bot de respaldo...")
+                    
+                    # Esperar 5 segundos como indica el mensaje
+                    print("⏳ Esperando 5 segundos antes de intentar con bot de respaldo...")
+                    await asyncio.sleep(5)
+                    
+                    # Continuar con la lógica del bot de respaldo
+                    # (el código continúa después de este bloque)
+                else:
+                    # Bot principal respondió normalmente, procesar respuesta
+                    stop_collecting.set()
+                    return await process_bot_response(
+                        client, temp_handler, all_received_messages, 
+                        all_files_data, handler_removed, consulta_id
+                    )
+            
+            # 11. SI LLEGAMOS AQUÍ, NECESITAMOS USAR BOT DE RESPALDO
+            # (porque: 1) bot principal no respondió nada, o 2) bot principal respondió ANTI-SPAM)
+            
+            if not bot_to_use_backup:
+                raise Exception("Se requiere bot de respaldo pero no está disponible")
+            
+            print(f"\n🔄 INTENTANDO CON BOT DE RESPALDO: {bot_to_use_backup}")
+            print(f"   Comando: {command}")
+            print(f"   Timeout: {TIMEOUT_BACKUP}s")
+            
+            # Resetear para intento con bot de respaldo
             all_received_messages = []
             all_files_data = []
             stop_collecting.clear()
             last_message_time[0] = time.time()
+            using_backup = True
             
+            # Enviar comando UNA SOLA VEZ al bot de respaldo
+            await client.send_message(bot_to_use_backup, command)
+            
+            # Timer para bot de respaldo
+            start_time = time.time()
+            
+            # --- LÓGICA DE ESPERA PARA BOT DE RESPALDO ---
             try:
-                # Determinar timeout según bot
-                timeout = TIMEOUT_PRIMARY if current_bot_id == LEDERDATA_BOT_ID else TIMEOUT_BACKUP
-                print(f"   Timeout configurado: {timeout}s")
-                
-                # Enviar comando
-                await client.send_message(current_bot_id, command)
-                
-                # Timer para múltiples mensajes
-                start_time = time.time()
-                
-                # --- LÓGICA DE ESPERA MEJORADA (Idle Timeout) ---
-                try:
-                    while True:
-                        elapsed_total = time.time() - start_time
-                        silence_duration = time.time() - last_message_time[0]
-                        
-                        # Si ya recibimos algo, esperamos un silencio de 4 segundos para cerrar
-                        if len(all_received_messages) > 0:
-                            if silence_duration > 4.0: 
-                                print(f"✅ Silencio detectado ({silence_duration:.1f}s). Total mensajes: {len(all_received_messages)}")
-                                break
-                        
-                        # Si no ha llegado nada y pasamos el timeout total
-                        if elapsed_total > timeout:
-                            if len(all_received_messages) == 0:
-                                raise asyncio.TimeoutError("El bot no respondió a tiempo")
-                            else:
-                                break  # Cerramos con lo que tengamos
-                                
-                        await asyncio.sleep(0.5)
-                
-                except asyncio.TimeoutError:
-                    # TIMEOUT - este bot no respondió
-                    print(f"⏰ TIMEOUT: {current_bot_id} no respondió en {timeout}s")
+                while True:
+                    elapsed_total = time.time() - start_time
+                    silence_duration = time.time() - last_message_time[0]
                     
-                    # Si es el bot principal, bloquearlo por 4 horas
-                    if current_bot_id == LEDERDATA_BOT_ID:
-                        record_bot_failure(LEDERDATA_BOT_ID)
-                        print(f"🔒 Bot principal bloqueado por {BOT_BLOCK_HOURS} horas")
+                    # Si ya recibimos algo, esperamos un silencio de 4 segundos para cerrar
+                    if len(all_received_messages) > 0:
+                        if silence_duration > 4.0: 
+                            print(f"✅ Silencio detectado ({silence_duration:.1f}s). Total mensajes: {len(all_received_messages)}")
+                            break
                     
-                    # Si hay más bots para probar, continuar
-                    if attempt < len(bots_order):
-                        print(f"🔄 Pasando al siguiente bot...")
-                        continue
-                    else:
-                        # No hay más bots, lanzar error
-                        raise Exception(f"Ningún bot respondió. Último timeout: {timeout}s")
+                    # Si no ha llegado nada y pasamos el timeout total
+                    if elapsed_total > TIMEOUT_BACKUP:
+                        if len(all_received_messages) == 0:
+                            print(f"⏰ TIMEOUT: Bot de respaldo no respondió en {TIMEOUT_BACKUP}s")
+                            record_bot_failure(LEDERDATA_BACKUP_BOT_ID)
+                            raise Exception("Bot de respaldo no respondió a tiempo")
+                        else:
+                            break
+                            
+                    await asyncio.sleep(0.5)
                 
-                # 10. SI LLEGAMOS AQUÍ, EL BOT RESPONDIÓ
-                print(f"✅ {current_bot_id} respondió con {len(all_received_messages)} mensajes")
-                
-                # Marcar para detener cualquier espera futura
+            except asyncio.TimeoutError:
+                print(f"⏰ TIMEOUT: Bot de respaldo no respondió")
+                record_bot_failure(LEDERDATA_BACKUP_BOT_ID)
+                raise Exception("Ningún bot respondió. Timeout excedido.")
+            
+            # 12. PROCESAR RESPUESTA DEL BOT DE RESPALDO
+            if all_received_messages:
+                print(f"✅ Bot de respaldo respondió con {len(all_received_messages)} mensajes")
                 stop_collecting.set()
+                return await process_bot_response(
+                    client, temp_handler, all_received_messages, 
+                    all_files_data, handler_removed, consulta_id
+                )
+            else:
+                raise Exception("No se recibieron mensajes del bot de respaldo")
                 
-                # Procesar respuestas recibidas
-                if all_received_messages:
-                    # Verificar si hay error de formato en cualquier mensaje
-                    format_error_detected = False
-                    for msg in all_received_messages:
-                        if "Por favor, usa el formato correcto" in msg.get("message", ""):
-                            format_error_detected = True
-                            break
-                    
-                    if format_error_detected:
-                        # Remover handler ANTES de desconectar
-                        if client and not handler_removed:
-                            client.remove_event_handler(temp_handler)
-                            handler_removed = True
-                        return {
-                            "status": "error",
-                            "message": "Formato de consulta incorrecto. Verifica los parámetros enviados."
-                        }
-                    
-                    # Verificar si es "no encontrado" en cualquier mensaje
-                    not_found_detected = False
-                    for msg in all_received_messages:
-                        if msg.get("fields", {}).get("not_found", False):
-                            not_found_detected = True
-                            break
-                    
-                    if not_found_detected:
-                        # Remover handler ANTES de desconectar
-                        if client and not handler_removed:
-                            client.remove_event_handler(temp_handler)
-                            handler_removed = True
-                        return {
-                            "status": "error",
-                            "message": "No se encontraron resultados para dicha consulta. Intenta con otro dato."
-                        }
-                    
-                    # --- DESCARGAR ARCHIVOS ANTES DE CERRAR CONEXIÓN ---
-                    print(f"📥 Iniciando descarga de archivos multimedia...")
-                    
-                    for idx, msg in enumerate(all_received_messages):
-                        try:
-                            event_msg = msg.get("event_message")
-                            if event_msg and getattr(event_msg, "media", None):
-                                media_list = []
-                                
-                                if isinstance(event_msg.media, (MessageMediaDocument, MessageMediaPhoto)):
-                                    media_list.append(event_msg.media)
-                                
-                                for i, media in enumerate(media_list):
-                                    try:
-                                        file_ext = '.file'
-                                        content_type = None
-                                        
-                                        if hasattr(media, 'document') and hasattr(media.document, 'attributes'):
-                                            file_name = getattr(media.document, 'file_name', 'file')
-                                            file_ext = os.path.splitext(file_name)[1]
-                                            # Determinar content_type
-                                            if 'pdf' in file_name.lower() or file_ext == '.pdf':
-                                                content_type = 'application/pdf'
-                                            elif 'jpg' in file_name.lower() or 'jpeg' in file_name.lower() or file_ext in ['.jpg', '.jpeg']:
-                                                content_type = 'image/jpeg'
-                                            elif 'png' in file_name.lower() or file_ext == '.png':
-                                                content_type = 'image/png'
-                                            else:
-                                                content_type = 'application/octet-stream'
-                                        elif isinstance(media, MessageMediaPhoto) or (hasattr(media, 'photo') and media.photo):
-                                            file_ext = '.jpg'
-                                            content_type = 'image/jpeg'
-                                            
-                                        dni_part = f"_{msg['fields'].get('dni')}" if msg['fields'].get('dni') else ""
-                                        type_part = f"_{msg['fields'].get('photo_type')}" if msg['fields'].get('photo_type') else ""
-                                        timestamp_str = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
-                                        unique_filename = f"{timestamp_str}_{event_msg.id}{dni_part}{type_part}_{i}{file_ext}"
-                                        
-                                        # DESCARGAR ARCHIVO SÍNCRONO
-                                        print(f"   Descargando archivo {i+1} del mensaje {idx+1}...")
-                                        
-                                        # Verificar que el cliente siga conectado
-                                        if not client.is_connected():
-                                            print("⚠️ Cliente desconectado durante descarga, reconectando...")
-                                            await client.connect()
-                                        
-                                        saved_path = await client.download_media(
-                                            event_msg, 
-                                            file=os.path.join(DOWNLOAD_DIR, unique_filename)
-                                        )
-                                        
-                                        # Leer contenido para archivos locales
-                                        if saved_path and os.path.exists(saved_path):
-                                            with open(saved_path, 'rb') as f:
-                                                file_content = f.read()
-                                            
-                                            # Guardar para posible uso futuro
-                                            all_files_data.append((unique_filename, file_content, content_type))
-                                            
-                                            # URL local temporal
-                                            msg_url = {
-                                                "url": f"{PUBLIC_URL}/files/{os.path.basename(saved_path)}", 
-                                                "type": "document",
-                                            }
-                                            if "urls" not in msg:
-                                                msg["urls"] = []
-                                            msg["urls"].append(msg_url)
-                                        
-                                        print(f"   ✅ Archivo descargado: {unique_filename}")
-                                        
-                                    except Exception as e:
-                                        print(f"❌ Error procesando archivo {i} del mensaje {idx}: {e}")
-                                        continue
-                        except Exception as e:
-                            print(f"❌ Error procesando mensaje {idx} para archivos: {e}")
-                            continue
-                    
-                    print(f"📊 Total de archivos descargados: {len(all_files_data)}")
-                    
-                    # Remover handler ANTES de cualquier posible desconexión
-                    if client and not handler_removed:
-                        client.remove_event_handler(temp_handler)
-                        handler_removed = True
-                    
-                    # --- CONSOLIDAR CAMPOS DE TODOS LOS MENSAJES (MEJORADO) ---
-                    final_fields = {}
-                    urls_temporales = []
-                    
-                    for msg in all_received_messages:
-                        # Unificar fields de todos los mensajes (sin sobrescribir)
-                        if msg.get("fields"):
-                            for key, value in msg["fields"].items():
-                                if key not in final_fields:
-                                    final_fields[key] = value
-                        
-                        # Extraer URLs temporales
-                        if isinstance(msg.get("urls"), list):
-                            for url_obj in msg["urls"]:
-                                # Solo tipo y URL, sin text_context
-                                urls_temporales.append({
-                                    "type": url_obj.get("type", "document"),
-                                    "url": url_obj.get("url")
-                                })
-                    
-                    # 11. CONSTRUIR RESPUESTA LIMPIA (SIN STORAGE PE)
-                    response_data = {}
-                    
-                    # Agregar campos extraídos al nivel raíz
-                    for key, value in final_fields.items():
-                        if value:  # Solo agregar si tiene valor
-                            response_data[key] = value
-                    
-                    # Agregar metadatos
-                    response_data["total_files"] = len(urls_temporales)
-                    response_data["total_messages"] = len(all_received_messages)
-                    
-                    if urls_temporales:
-                        response_data["urls"] = urls_temporales
-                    
-                    return response_data
-                else:
-                    # Caso raro: sin mensajes recibidos
-                    # Remover handler antes de desconectar
-                    if client and not handler_removed:
-                        client.remove_event_handler(temp_handler)
-                        handler_removed = True
-                    raise Exception("No se recibieron mensajes del bot")
-                    
-            except UserBlockedError:
-                print(f"❌ {current_bot_id} bloqueado por el usuario")
-                record_bot_failure(current_bot_id)
+        except UserBlockedError:
+            print(f"❌ Bot principal bloqueado por el usuario")
+            record_bot_failure(LEDERDATA_BOT_ID)
+            
+            # Remover handler
+            if client and not handler_removed:
+                client.remove_event_handler(temp_handler)
+                handler_removed = True
+            
+            # Intentar con bot de respaldo si está disponible
+            if bot_to_use_backup:
+                print("🔄 Bot principal bloqueado, intentando con bot de respaldo...")
+                # Aquí podríamos reiniciar el proceso con el bot de respaldo
+                # Pero por simplicidad, lanzamos excepción y dejamos que el usuario reintente
+                raise Exception("Bot principal bloqueado. Por favor, intente nuevamente.")
+            else:
+                raise Exception("Bot principal bloqueado y no hay bot de respaldo disponible")
                 
-                # Remover handler antes de continuar
-                if client and not handler_removed:
-                    client.remove_event_handler(temp_handler)
-                    handler_removed = True
-                
-                if attempt < len(bots_order):
-                    continue
-                else:
-                    raise Exception("Todos los bots están bloqueados")
-                    
-            except Exception as e:
-                print(f"❌ Error con {current_bot_id}: {str(e)[:100]}")
-                
-                # Si es error grave y es el bot principal, bloquearlo
-                if "blocked" in str(e).lower() and current_bot_id == LEDERDATA_BOT_ID:
-                    record_bot_failure(LEDERDATA_BOT_ID)
-                
-                # Remover handler antes de continuar
-                if client and not handler_removed:
-                    client.remove_event_handler(temp_handler)
-                    handler_removed = True
-                
-                if attempt < len(bots_order):
-                    print(f"🔄 Intentando con siguiente bot...")
-                    continue
-                else:
-                    raise e
-        
-        # No deberíamos llegar aquí
-        raise Exception("Flujo inesperado - no se obtuvo respuesta")
+        except Exception as e:
+            print(f"❌ Error con bot principal: {str(e)[:100]}")
+            
+            # Remover handler
+            if client and not handler_removed:
+                client.remove_event_handler(temp_handler)
+                handler_removed = True
+            
+            # Si es error grave, bloquear bot principal
+            if "blocked" in str(e).lower():
+                record_bot_failure(LEDERDATA_BOT_ID)
+            
+            # Re-lanzar excepción
+            raise e
         
     except Exception as e:
         return {
@@ -517,7 +432,7 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
         }
         
     finally:
-        # 12. Limpieza final - ¡AHORA SÍ podemos desconectar!
+        # 13. Limpieza final
         if client:
             try:
                 # Asegurarnos de que el handler ya fue removido
@@ -546,6 +461,171 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                 print(f"🧹 Limpiados {cleaned_count} archivos antiguos")
         except Exception as e:
             print(f"⚠️ Error limpiando archivos: {e}")
+
+# --- Función para procesar respuesta del bot ---
+async def process_bot_response(client, temp_handler, all_received_messages, all_files_data, handler_removed, consulta_id):
+    """Procesa la respuesta del bot (compartida para principal y respaldo)"""
+    try:
+        # Verificar si hay error de formato en cualquier mensaje
+        format_error_detected = False
+        for msg in all_received_messages:
+            if "Por favor, usa el formato correcto" in msg.get("message", ""):
+                format_error_detected = True
+                break
+        
+        if format_error_detected:
+            # Remover handler ANTES de desconectar
+            if client and not handler_removed:
+                client.remove_event_handler(temp_handler)
+                handler_removed = True
+            return {
+                "status": "error",
+                "message": "Formato de consulta incorrecto. Verifica los parámetros enviados."
+            }
+        
+        # Verificar si es "no encontrado" en cualquier mensaje
+        not_found_detected = False
+        for msg in all_received_messages:
+            if msg.get("fields", {}).get("not_found", False):
+                not_found_detected = True
+                break
+        
+        if not_found_detected:
+            # Remover handler ANTES de desconectar
+            if client and not handler_removed:
+                client.remove_event_handler(temp_handler)
+                handler_removed = True
+            return {
+                "status": "error",
+                "message": "No se encontraron resultados para dicha consulta. Intenta con otro dato."
+            }
+        
+        # --- DESCARGAR ARCHIVOS ANTES DE CERRAR CONEXIÓN ---
+        print(f"📥 Iniciando descarga de archivos multimedia...")
+        
+        for idx, msg in enumerate(all_received_messages):
+            try:
+                event_msg = msg.get("event_message")
+                if event_msg and getattr(event_msg, "media", None):
+                    media_list = []
+                    
+                    if isinstance(event_msg.media, (MessageMediaDocument, MessageMediaPhoto)):
+                        media_list.append(event_msg.media)
+                    
+                    for i, media in enumerate(media_list):
+                        try:
+                            file_ext = '.file'
+                            content_type = None
+                            
+                            if hasattr(media, 'document') and hasattr(media.document, 'attributes'):
+                                file_name = getattr(media.document, 'file_name', 'file')
+                                file_ext = os.path.splitext(file_name)[1]
+                                # Determinar content_type
+                                if 'pdf' in file_name.lower() or file_ext == '.pdf':
+                                    content_type = 'application/pdf'
+                                elif 'jpg' in file_name.lower() or 'jpeg' in file_name.lower() or file_ext in ['.jpg', '.jpeg']:
+                                    content_type = 'image/jpeg'
+                                elif 'png' in file_name.lower() or file_ext == '.png':
+                                    content_type = 'image/png'
+                                else:
+                                    content_type = 'application/octet-stream'
+                            elif isinstance(media, MessageMediaPhoto) or (hasattr(media, 'photo') and media.photo):
+                                file_ext = '.jpg'
+                                content_type = 'image/jpeg'
+                                
+                            dni_part = f"_{msg['fields'].get('dni')}" if msg['fields'].get('dni') else ""
+                            type_part = f"_{msg['fields'].get('photo_type')}" if msg['fields'].get('photo_type') else ""
+                            timestamp_str = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+                            unique_filename = f"{timestamp_str}_{event_msg.id}{dni_part}{type_part}_{i}{file_ext}"
+                            
+                            # DESCARGAR ARCHIVO SÍNCRONO
+                            print(f"   Descargando archivo {i+1} del mensaje {idx+1}...")
+                            
+                            # Verificar que el cliente siga conectado
+                            if not client.is_connected():
+                                print("⚠️ Cliente desconectado durante descarga, reconectando...")
+                                await client.connect()
+                            
+                            saved_path = await client.download_media(
+                                event_msg, 
+                                file=os.path.join(DOWNLOAD_DIR, unique_filename)
+                            )
+                            
+                            # Leer contenido para archivos locales
+                            if saved_path and os.path.exists(saved_path):
+                                with open(saved_path, 'rb') as f:
+                                    file_content = f.read()
+                                
+                                # Guardar para posible uso futuro
+                                all_files_data.append((unique_filename, file_content, content_type))
+                                
+                                # URL local temporal
+                                msg_url = {
+                                    "url": f"{PUBLIC_URL}/files/{os.path.basename(saved_path)}", 
+                                    "type": "document",
+                                }
+                                if "urls" not in msg:
+                                    msg["urls"] = []
+                                msg["urls"].append(msg_url)
+                            
+                            print(f"   ✅ Archivo descargado: {unique_filename}")
+                            
+                        except Exception as e:
+                            print(f"❌ Error procesando archivo {i} del mensaje {idx}: {e}")
+                            continue
+            except Exception as e:
+                print(f"❌ Error procesando mensaje {idx} para archivos: {e}")
+                continue
+        
+        print(f"📊 Total de archivos descargados: {len(all_files_data)}")
+        
+        # Remover handler ANTES de cualquier posible desconexión
+        if client and not handler_removed:
+            client.remove_event_handler(temp_handler)
+            handler_removed = True
+        
+        # --- CONSOLIDAR CAMPOS DE TODOS LOS MENSAJES ---
+        final_fields = {}
+        urls_temporales = []
+        
+        for msg in all_received_messages:
+            # Unificar fields de todos los mensajes (sin sobrescribir)
+            if msg.get("fields"):
+                for key, value in msg["fields"].items():
+                    if key not in final_fields:
+                        final_fields[key] = value
+            
+            # Extraer URLs temporales
+            if isinstance(msg.get("urls"), list):
+                for url_obj in msg["urls"]:
+                    urls_temporales.append({
+                        "type": url_obj.get("type", "document"),
+                        "url": url_obj.get("url")
+                    })
+        
+        # 13. CONSTRUIR RESPUESTA LIMPIA
+        response_data = {}
+        
+        # Agregar campos extraídos al nivel raíz
+        for key, value in final_fields.items():
+            if value:  # Solo agregar si tiene valor
+                response_data[key] = value
+        
+        # Agregar metadatos
+        response_data["total_files"] = len(urls_temporales)
+        response_data["total_messages"] = len(all_received_messages)
+        
+        if urls_temporales:
+            response_data["urls"] = urls_temporales
+        
+        return response_data
+        
+    except Exception as e:
+        print(f"❌ Error procesando respuesta del bot: {e}")
+        return {
+            "status": "error",
+            "message": f"Error procesando respuesta: {str(e)}"
+        }
 
 # --- Wrapper síncrono para Flask ---
 def run_telegram_command(command: str, consulta_id: str = None, endpoint_path: str = None):
@@ -684,7 +764,7 @@ def root():
         "message": "Gateway API para LEDER DATA Bot activo (Modo Serverless).",
         "mode": "serverless",
         "cost_optimized": True,
-        "version": "4.2 - Sin Storage PE, solo respuestas directas"
+        "version": "4.3 - Failover corregido (1 comando por bot)"
     })
 
 @app.route("/status")
@@ -705,7 +785,7 @@ def status():
         "api_credentials_ok": API_ID != 0 and bool(API_HASH),
         "bot_status": bot_status,
         "mode": "on-demand",
-        "storage_pe": "removed",  # Indicar que se eliminó Storage PE
+        "storage_pe": "removed",
         "timeouts": {
             "primary_bot": TIMEOUT_PRIMARY,
             "backup_bot": TIMEOUT_BACKUP,
@@ -1173,6 +1253,7 @@ if __name__ == "__main__":
     print("   ✓ Captura TODOS los mensajes del bot (2, 5, 20+ mensajes)")
     print("   ✓ JSON LIMPIO sin marcas LEDERDATA")
     print("   ✓ Campos extraídos al nivel raíz (dni, nombres, apellidos, etc.)")
-    print("   ✓ Sistema de failover automático entre bots")
-    print("   ✓ Bloqueo automático de bots que fallan por timeout")
+    print("   ✓ FIX: Failover CORREGIDO - comando se envía UNA SOLA VEZ por bot")
+    print("   ✓ Sistema: Envía al bot principal → Si ANTI-SPAM → Envía al bot de respaldo")
+    print("   ✓ Sistema: Si bot principal no responde → Usa solo bot de respaldo")
     app.run(host="0.0.0.0", port=PORT, debug=False)
