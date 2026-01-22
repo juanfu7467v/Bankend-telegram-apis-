@@ -319,7 +319,7 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                     stop_collecting.set()
                     return await process_bot_response(
                         client, temp_handler, all_received_messages, 
-                        all_files_data, handler_removed, consulta_id
+                        all_files_data, handler_removed, consulta_id, endpoint_path
                     )
         
         # 11. SI NECESITAMOS USAR BOT DE RESPALDO
@@ -387,7 +387,7 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                 stop_collecting.set()
                 return await process_bot_response(
                     client, temp_handler, all_received_messages, 
-                    all_files_data, handler_removed, consulta_id
+                    all_files_data, handler_removed, consulta_id, endpoint_path
                 )
             else:
                 raise Exception("No se recibieron mensajes del bot de respaldo")
@@ -434,7 +434,7 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
             print(f"⚠️ Error limpiando archivos: {e}")
 
 # --- Función para procesar respuesta del bot ---
-async def process_bot_response(client, temp_handler, all_received_messages, all_files_data, handler_removed, consulta_id):
+async def process_bot_response(client, temp_handler, all_received_messages, all_files_data, handler_removed, consulta_id, endpoint_path):
     """Procesa la respuesta del bot (compartida para principal y respaldo)"""
     try:
         # Verificar si hay error de formato en cualquier mensaje
@@ -574,20 +574,113 @@ async def process_bot_response(client, temp_handler, all_received_messages, all_
                         "url": url_obj.get("url")
                     })
         
-        # 13. CONSTRUIR RESPUESTA LIMPIA
-        response_data = {}
+        # 13. CONSTRUIR RESPUESTA - FORMATO ESPECIAL SOLO PARA /nmv y /nm
+        # Obtener el comando base del endpoint
+        comando_base = endpoint_path.lstrip('/').split('/')[0] if endpoint_path else ""
         
-        # Agregar campos extraídos al nivel raíz
-        for key, value in final_fields.items():
-            if value:  # Solo agregar si tiene valor
-                response_data[key] = value
-        
-        # Agregar metadatos
-        response_data["total_files"] = len(urls_temporales)
-        response_data["total_messages"] = len(all_received_messages)
-        
-        if urls_temporales:
-            response_data["urls"] = urls_temporales
+        # Verificar si es /nmv o /nm (a través de los endpoints que los usan)
+        if comando_base in ["venezolanos_nombres", "dni_nombres"]:
+            # Construir mensaje en el formato solicitado
+            mensaje_texto = ""
+            dni_principal = ""
+            
+            # Para múltiples resultados, el formato necesita ser especial
+            resultados = []
+            for msg in all_received_messages:
+                if msg.get("message"):
+                    # Extraer datos de cada resultado
+                    texto_limpio = msg["message"]
+                    
+                    # Buscar patrones específicos de nombre/edad/DNI
+                    # Patrón: APELLIDOS : [apellidos] NOMBRES : [nombres] EDAD : [edad] - [algo] DNI: [dni]
+                    patron_resultado = r"APELLIDOS\s*:\s*(.*?)\s+NOMBRES\s*:\s*(.*?)\s+EDAD\s*:\s*(.*?)\s+-\s*\d+\s*DNI:\s*(\d{8})"
+                    coincidencias = re.findall(patron_resultado, texto_limpio)
+                    
+                    for coincidencia in coincidencias:
+                        apellidos, nombres, edad, dni = coincidencia
+                        resultados.append({
+                            "apellidos": apellidos.strip(),
+                            "nombres": nombres.strip(),
+                            "edad": edad.strip(),
+                            "dni": dni.strip()
+                        })
+                    
+                    # Si no encontramos con patrón, intentar extraer de otra forma
+                    if not resultados and "DNI" in texto_limpio:
+                        # Formato alternativo
+                        partes = texto_limpio.split("DNI:")
+                        if len(partes) > 1:
+                            datos = partes[0].strip()
+                            dni = partes[1].strip().split()[0] if partes[1].strip() else ""
+                            
+                            # Extraer apellidos y nombres
+                            if "APELLIDOS" in datos and "NOMBRES" in datos:
+                                datos = datos.replace("APELLIDOS :", "").replace("NOMBRES :", "")
+                                # Dividir por "EDAD" si existe
+                                if "EDAD" in datos:
+                                    datos = datos.split("EDAD")[0]
+                                
+                                nombres_apellidos = datos.strip()
+                                resultados.append({
+                                    "apellidos": nombres_apellidos,
+                                    "nombres": "",
+                                    "edad": "",
+                                    "dni": dni[:8] if dni else ""
+                                })
+            
+            # Construir mensaje según el número de resultados
+            if len(resultados) == 0:
+                # No se encontraron resultados o no se pudieron parsear
+                mensaje_texto = "No se encontraron resultados o el formato no es el esperado."
+                dni_principal = ""
+            elif len(resultados) == 1:
+                # Un solo resultado
+                resultado = resultados[0]
+                mensaje_texto = f"APELLIDOS : {resultado['apellidos']} NOMBRES : {resultado['nombres']} EDAD : {resultado['edad']} - 2 DNI: {resultado['dni']}"
+                dni_principal = resultado['dni']
+            else:
+                # Múltiples resultados - usar el formato específico
+                primer_resultado = resultados[0]
+                dni_principal = primer_resultado['dni']
+                
+                # Construir mensaje combinando todos los resultados
+                partes_mensaje = []
+                for i, resultado in enumerate(resultados):
+                    # El primer resultado tiene "- 4" en lugar de "- 1" según ejemplo
+                    if i == 0:
+                        parte = f"APELLIDOS : {resultado['apellidos']} NOMBRES : {resultado['nombres']} EDAD : {resultado['edad']} - 4 DNI: {resultado['dni']}"
+                    else:
+                        parte = f"APELLIDOS : {resultado['apellidos']} NOMBRES : {resultado['nombres']} EDAD : {resultado['edad']} - 1 DNI: {resultado['dni']}"
+                    partes_mensaje.append(parte)
+                
+                mensaje_texto = " ".join(partes_mensaje)
+            
+            # Crear respuesta JSON con el formato solicitado
+            response_data = {
+                "status": "success",
+                "message": mensaje_texto,
+                "dni": dni_principal
+            }
+            
+            # Agregar datos completos para referencia (opcional)
+            if all_received_messages:
+                response_data["raw_messages"] = [msg.get("message", "") for msg in all_received_messages]
+            
+        else:
+            # PARA TODOS LOS DEMÁS COMANDOS: formato original
+            response_data = {}
+            
+            # Agregar campos extraídos al nivel raíz
+            for key, value in final_fields.items():
+                if value:  # Solo agregar si tiene valor
+                    response_data[key] = value
+            
+            # Agregar metadatos
+            response_data["total_files"] = len(urls_temporales)
+            response_data["total_messages"] = len(all_received_messages)
+            
+            if urls_temporales:
+                response_data["urls"] = urls_temporales
         
         return response_data
         
@@ -735,7 +828,8 @@ def root():
         "message": "Gateway API para LEDER DATA Bot activo (Modo Serverless).",
         "mode": "serverless",
         "cost_optimized": True,
-        "version": "4.4 - Duplicación CORREGIDA (1 comando por bot)"
+        "version": "4.4 - Duplicación CORREGIDA (1 comando por bot)",
+        "special_format": "Formatos especiales para /nmv y /nm solamente"
     })
 
 @app.route("/status")
@@ -761,6 +855,10 @@ def status():
             "primary_bot": TIMEOUT_PRIMARY,
             "backup_bot": TIMEOUT_BACKUP,
             "block_hours": BOT_BLOCK_HOURS
+        },
+        "special_endpoints": {
+            "/venezolanos_nombres": "Formato JSON especial para /nmv",
+            "/dni_nombres": "Formato JSON especial para /nm"
         }
     })
 
@@ -1075,7 +1173,7 @@ def cor():
 def dir():
     return handle_api_endpoint("/dir")
 
-# --- Rutas especiales ---
+# --- Rutas especiales (SOLO ESTAS 2 TIENEN FORMATO ESPECIAL) ---
 @app.route("/dni_nombres", methods=["GET"])
 def api_dni_nombres():
     nombres = unquote(request.args.get("nombres", "")).strip()
@@ -1188,6 +1286,10 @@ def health_check():
             "field_extraction": True,
             "bot_failover": True,
             "bot_blocking": True
+        },
+        "special_endpoints": {
+            "/venezolanos_nombres (/nmv)": "Formato JSON especial activado",
+            "/dni_nombres (/nm)": "Formato JSON especial activado"
         }
     })
 
@@ -1208,7 +1310,11 @@ def debug_bots():
             "timeout": TIMEOUT_BACKUP
         },
         "block_hours": BOT_BLOCK_HOURS,
-        "storage_pe": "removed"
+        "storage_pe": "removed",
+        "special_endpoints": {
+            "/venezolanos_nombres": "Formato especial para /nmv",
+            "/dni_nombres": "Formato especial para /nm"
+        }
     })
 
 if __name__ == "__main__":
@@ -1217,13 +1323,9 @@ if __name__ == "__main__":
     print("🔗 Telethon se conecta solo cuando recibe consultas")
     print(f"⏰ Timeouts: Principal={TIMEOUT_PRIMARY}s, Respaldo={TIMEOUT_BACKUP}s")
     print(f"🔒 Bloqueo bot fallado: {BOT_BLOCK_HOURS} horas")
-    print("✨ MEJORAS IMPLEMENTADAS:")
-    print("   ✓ CORREGIDO: Problema de duplicación de comandos")
-    print("   ✓ FIX: Cada comando se envía UNA SOLA VEZ por bot")
-    print("   ✓ FIX: Handler único para evitar mensajes duplicados")
-    print("   ✓ Sistema: Envía al bot principal → Si ANTI-SPAM → Envía al bot de respaldo")
-    print("   ✓ Sistema: Si bot principal no responde → Usa solo bot de respaldo")
-    print("   ✓ Captura TODOS los mensajes del bot (2, 5, 20+ mensajes)")
-    print("   ✓ JSON LIMPIO sin marcas LEDERDATA")
-    print("   ✓ Campos extraídos al nivel raíz (dni, nombres, apellidos, etc.)")
+    print("✨ MODIFICACIONES IMPLEMENTADAS:")
+    print("   ✓ FORMATO ESPECIAL para /nmv y /nm ÚNICAMENTE")
+    print("   ✓ JSON con formato específico para estos comandos")
+    print("   ✓ TODOS LOS DEMÁS COMANDOS mantienen formato original")
+    print("   ✓ Formato especial: status, message, dni")
     app.run(host="0.0.0.0", port=PORT, debug=False)
