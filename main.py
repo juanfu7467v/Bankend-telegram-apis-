@@ -126,9 +126,9 @@ def clean_and_extract(raw_text: str):
     
     return {"text": text, "fields": fields}
 
-# --- Función para formatear respuesta de NM y NMV ---
+# --- Función MEJORADA para formatear respuesta de NM y NMV ---
 def format_nm_response(all_received_messages):
-    """Formatea la respuesta para los comandos /nm y /nmv según el formato solicitado"""
+    """Formatea la respuesta para los comandos /nm y /nmv para mostrar TODOS los resultados"""
     
     # Combinar todos los textos de los mensajes
     combined_text = ""
@@ -149,20 +149,45 @@ def format_nm_response(all_received_messages):
     multi_match = re.search(r"Se encontro\s+(\d+)\s+resultados?\.?", combined_text, re.IGNORECASE)
     
     if multi_match:
-        # Para resultados múltiples, mantener el formato exacto pero limpiar
-        cleaned_text = combined_text
+        # Para resultados múltiples, mantener el formato EXACTO del bot
+        # Solo limpiar el encabezado pero mantener toda la estructura de datos
         
-        # Eliminar líneas vacías al inicio y final
-        cleaned_text = re.sub(r'^\s*\n+', '', cleaned_text)
-        cleaned_text = re.sub(r'\n\s*\n+', '\n', cleaned_text)
-        cleaned_text = cleaned_text.strip()
+        # Eliminar solo el encabezado inicial que menciona PREMIUM
+        # pero mantener todo el contenido de resultados
+        lines = combined_text.split('\n')
+        cleaned_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            # Eliminar líneas que contengan solo el encabezado PREMIUM
+            if "RENIEC NOMBRES [PREMIUM]" in line or "RENIEC NOMBRES" in line and "PREMIUM" in line:
+                # Extraer solo la parte útil del encabezado
+                if "Se encontro" in line:
+                    # Mantener el conteo de resultados
+                    count_part = re.search(r"Se encontro\s+\d+\s+resultados?", line, re.IGNORECASE)
+                    if count_part:
+                        cleaned_lines.append(f"→ {count_part.group(0)}.")
+                continue
+            
+            # Mantener todas las demás líneas
+            if line:
+                cleaned_lines.append(line)
+        
+        # Si no quedaron líneas después de limpiar, usar el texto original
+        if not cleaned_lines:
+            formatted_text = combined_text
+        else:
+            formatted_text = '\n'.join(cleaned_lines)
+        
+        # Asegurar que el texto tenga el formato correcto
+        formatted_text = formatted_text.strip()
         
         return json.dumps({
             "status": "success",
-            "message": cleaned_text
+            "message": formatted_text
         }, ensure_ascii=False)
     else:
-        # Para resultado único, extraer cada campo
+        # Para resultado único, extraer cada campo manteniendo formato
         lines = combined_text.split('\n')
         formatted_lines = []
         
@@ -271,7 +296,13 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                 last_message_time[0] = time.time()
                 
                 raw_text = event.raw_text or ""
-                cleaned = clean_and_extract(raw_text)
+                
+                # IMPORTANTE: Para comandos NM y NMV, NO aplicar limpieza normal
+                # Mantener el texto original para procesamiento especial
+                if endpoint_path in ["/dni_nombres", "/venezolanos_nombres"] or command.startswith("/nm") or command.startswith("/nmv"):
+                    cleaned = {"text": raw_text, "fields": {}}
+                else:
+                    cleaned = clean_and_extract(raw_text)
                 
                 # Verificar match de DNI si existe
                 if dni and cleaned["fields"].get("dni") != dni:
@@ -322,16 +353,22 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                     elapsed_total = time.time() - start_time
                     silence_duration = time.time() - last_message_time[0]
                     
-                    # Si ya recibimos algo, esperamos un silencio de 4 segundos para cerrar
+                    # Para comandos NM/NMV, esperar más tiempo para capturar todos los resultados
+                    timeout_to_use = TIMEOUT_PRIMARY
+                    if endpoint_path in ["/dni_nombres", "/venezolanos_nombres"] or command.startswith("/nm") or command.startswith("/nmv"):
+                        timeout_to_use = 60  # 60 segundos para NM/NMV
+                    
+                    # Si ya recibimos algo, esperamos un silencio de 5 segundos para cerrar
                     if len(all_received_messages) > 0:
-                        if silence_duration > 4.0: 
+                        silence_threshold = 5.0 if endpoint_path in ["/dni_nombres", "/venezolanos_nombres"] or command.startswith("/nm") or command.startswith("/nmv") else 4.0
+                        if silence_duration > silence_threshold: 
                             print(f"✅ Silencio detectado ({silence_duration:.1f}s). Total mensajes: {len(all_received_messages)}")
                             break
                     
                     # Si no ha llegado nada y pasamos el timeout total
-                    if elapsed_total > TIMEOUT_PRIMARY:
+                    if elapsed_total > timeout_to_use:
                         if len(all_received_messages) == 0:
-                            print(f"⏰ TIMEOUT: Bot principal no respondió en {TIMEOUT_PRIMARY}s")
+                            print(f"⏰ TIMEOUT: Bot principal no respondió en {timeout_to_use}s")
                             # Bot principal está caído/lageado
                             record_bot_failure(LEDERDATA_BOT_ID)
                             break  # Salir para intentar con bot de respaldo
@@ -418,16 +455,22 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                 elapsed_total = time.time() - start_time
                 silence_duration = time.time() - last_message_time[0]
                 
-                # Si ya recibimos algo, esperamos un silencio de 4 segundos para cerrar
+                # Para comandos NM/NMV, usar timeout extendido
+                timeout_to_use = TIMEOUT_BACKUP
+                if endpoint_path in ["/dni_nombres", "/venezolanos_nombres"] or command.startswith("/nm") or command.startswith("/nmv"):
+                    timeout_to_use = 70  # 70 segundos para NM/NMV en respaldo
+                
+                # Si ya recibimos algo, esperamos un silencio de 5 segundos para cerrar
                 if len(all_received_messages) > 0:
-                    if silence_duration > 4.0: 
+                    silence_threshold = 5.0 if endpoint_path in ["/dni_nombres", "/venezolanos_nombres"] or command.startswith("/nm") or command.startswith("/nmv") else 4.0
+                    if silence_duration > silence_threshold: 
                         print(f"✅ Silencio detectado ({silence_duration:.1f}s). Total mensajes: {len(all_received_messages)}")
                         break
                 
                 # Si no ha llegado nada y pasamos el timeout total
-                if elapsed_total > TIMEOUT_BACKUP:
+                if elapsed_total > timeout_to_use:
                     if len(all_received_messages) == 0:
-                        print(f"⏰ TIMEOUT: Bot de respaldo no respondió en {TIMEOUT_BACKUP}s")
+                        print(f"⏰ TIMEOUT: Bot de respaldo no respondió en {timeout_to_use}s")
                         record_bot_failure(LEDERDATA_BACKUP_BOT_ID)
                         raise Exception("Bot de respaldo no respondió a tiempo")
                     else:
@@ -807,7 +850,7 @@ def root():
         "message": "Gateway API para LEDER DATA Bot activo (Modo Serverless).",
         "mode": "serverless",
         "cost_optimized": True,
-        "version": "4.4 - Duplicación CORREGIDA (1 comando por bot)"
+        "version": "4.5 - NM/NMV Completo Fix"
     })
 
 @app.route("/status")
@@ -833,6 +876,11 @@ def status():
             "primary_bot": TIMEOUT_PRIMARY,
             "backup_bot": TIMEOUT_BACKUP,
             "block_hours": BOT_BLOCK_HOURS
+        },
+        "special_features": {
+            "nm_nmv_full_results": True,
+            "nm_timeout_extended": 60,
+            "nmv_timeout_extended": 60
         }
     })
 
@@ -1192,7 +1240,7 @@ def api_dni_nombres():
     except FutureTimeoutError:
         return jsonify({
             "status": "error", 
-            "message": f"Error interno: Timeout excedido ({TIMEOUT_BACKUP}s)."
+            "message": f"Error interno: Timeout excedido (60s para NM)."
         }), 504
     except Exception as e:
         return jsonify({
@@ -1234,7 +1282,7 @@ def api_venezolanos_nombres():
     except FutureTimeoutError:
         return jsonify({
             "status": "error", 
-            "message": f"Error interno: Timeout excedido ({TIMEOUT_BACKUP}s)."
+            "message": f"Error interno: Timeout excedido (60s para NMV)."
         }), 504
     except Exception as e:
         return jsonify({
@@ -1266,7 +1314,8 @@ def health_check():
             "field_extraction": True,
             "bot_failover": True,
             "bot_blocking": True,
-            "nm_nmv_special_format": True  # Nueva característica
+            "nm_nmv_special_format": True,
+            "nm_nmv_full_results": True  # Nueva característica
         }
     })
 
@@ -1278,19 +1327,26 @@ def debug_bots():
             "id": LEDERDATA_BOT_ID,
             "blocked": is_bot_blocked(LEDERDATA_BOT_ID),
             "last_fail": bot_fail_tracker.get(LEDERDATA_BOT_ID, {}),
-            "timeout": TIMEOUT_PRIMARY
+            "timeout": TIMEOUT_PRIMARY,
+            "nm_timeout": 60
         },
         "backup_bot": {
             "id": LEDERDATA_BACKUP_BOT_ID,
             "blocked": is_bot_blocked(LEDERDATA_BACKUP_BOT_ID),
             "last_fail": bot_fail_tracker.get(LEDERDATA_BACKUP_BOT_ID, {}),
-            "timeout": TIMEOUT_BACKUP
+            "timeout": TIMEOUT_BACKUP,
+            "nm_timeout": 70
         },
         "block_hours": BOT_BLOCK_HOURS,
         "storage_pe": "removed",
         "special_formats": {
-            "nm": "Formato JSON especial activado",
-            "nmv": "Formato JSON especial activado"
+            "nm": "Formato JSON especial activado - RESULTADOS COMPLETOS",
+            "nmv": "Formato JSON especial activado - RESULTADOS COMPLETOS"
+        },
+        "changes": {
+            "nm_nmv_fix": "Ahora devuelve todos los resultados completos",
+            "timeout_extended": "Timeout extendido para NM/NMV",
+            "raw_text_preserved": "Texto original preservado para NM/NMV"
         }
     })
 
@@ -1301,16 +1357,19 @@ if __name__ == "__main__":
     print(f"⏰ Timeouts: Principal={TIMEOUT_PRIMARY}s, Respaldo={TIMEOUT_BACKUP}s")
     print(f"🔒 Bloqueo bot fallado: {BOT_BLOCK_HOURS} horas")
     print("✨ MEJORAS IMPLEMENTADAS:")
+    print("   ✓ FIX NM/NMV: Ahora devuelve TODOS los resultados completos")
+    print("   ✓ FIX: Timeout extendido para NM/NMV (60s principal, 70s respaldo)")
+    print("   ✓ FIX: Texto original preservado para NM/NMV (sin limpieza)")
+    print("   ✓ FIX: Formato especial mantiene estructura completa del bot")
     print("   ✓ CORREGIDO: Problema de duplicación de comandos")
     print("   ✓ FIX: Cada comando se envía UNA SOLA VEZ por bot")
     print("   ✓ FIX: Handler único para evitar mensajes duplicados")
     print("   ✓ Sistema: Envía al bot principal → Si ANTI-SPAM → Envía al bot de respaldo")
     print("   ✓ Sistema: Si bot principal no responde → Usa solo bot de respaldo")
     print("   ✓ Captura TODOS los mensajes del bot (2, 5, 20+ mensajes)")
-    print("   ✓ JSON LIMPIO sin marcas LEDERDATA")
-    print("   ✓ Campos extraídos al nivel raíz (dni, nombres, apellidos, etc.)")
     print("   🎯 FORMATO ESPECIAL para /nm y /nmv:")
     print("     - JSON con estructura fija: {'status': 'success', 'message': 'texto formateado'}")
+    print("     - Devuelve TODOS los resultados encontrados (no solo el primero)")
     print("     - Solo aplica a /dni_nombres y /venezolanos_nombres")
     print("     - Todos los demás comandos permanecen intactos")
     app.run(host="0.0.0.0", port=PORT, debug=False)
